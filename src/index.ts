@@ -497,10 +497,11 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "hcEstimate",
       name: "Initial full-heat duration",
-      description: "Starting guess for a full heat-up. The recipe refines it after each cycle.",
+      description:
+        "Starting guess for a full heat-up. Refined after each cycle once the power channel is proven — until then it is used as-is, so err on the generous side: overshooting only means the tank thermostat regulates for a while, undershooting means lukewarm water.",
       type: "duration",
       required: false,
-      defaultValue: "3h",
+      defaultValue: "4h",
       group: "hc",
     },
     {
@@ -612,10 +613,11 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "maxCycle",
       name: "Maximum continuous run",
-      description: "Hard safety cap on a single uninterrupted heat-up",
+      description:
+        "Hard safety cap on a single uninterrupted heat-up. Keep it above the full-heat duration, or it will cut a legitimate off-peak cycle short.",
       type: "duration",
       required: false,
-      defaultValue: "5h",
+      defaultValue: "6h",
       group: "advanced",
     },
   ];
@@ -673,7 +675,8 @@ const FR: RecipeLangPack = {
     },
     hcEstimate: {
       name: "Durée de chauffe initiale",
-      description: "Estimation de départ d'une chauffe complète. La recette l'affine à chaque cycle.",
+      description:
+        "Estimation de départ d'une chauffe complète. Affinée à chaque cycle une fois la mesure de puissance validée ; d'ici là elle est utilisée telle quelle, donc voir large : surestimer fait seulement réguler le thermostat du ballon, sous-estimer donne de l'eau tiède.",
     },
     fullCycleEveryDays: {
       name: "Cycle complet forcé tous les (jours)",
@@ -727,7 +730,8 @@ const FR: RecipeLangPack = {
     },
     maxCycle: {
       name: "Durée de chauffe maximale",
-      description: "Garde-fou sur une chauffe continue",
+      description:
+        "Garde-fou sur une chauffe continue. À garder au-dessus de la durée de chauffe complète, sinon il coupera un cycle d'heures creuses légitime.",
     },
   },
   groups: {
@@ -844,7 +848,7 @@ export function createRecipe(): RecipeDefinition {
 
       const cutoffPower = toNumber(params.cutoffPower) ?? 300;
       const cutoffDelayMs = ctx.helpers.parseDuration(params.cutoffDelay ?? "5m");
-      const maxCycleMs = ctx.helpers.parseDuration(params.maxCycle ?? "5h");
+      const maxCycleMs = ctx.helpers.parseDuration(params.maxCycle ?? "6h");
 
       const solarSourceId = solarMode === "grid_injection" ? gridId : productionId;
 
@@ -1430,7 +1434,7 @@ export function createRecipe(): RecipeDefinition {
           storedEstimate !== null && storedEstimate > 0
             ? Math.min(storedEstimate, hcWindowMin)
             : Math.min(
-                Math.max(15, Math.round(ctx.helpers.parseDuration(params.hcEstimate ?? "3h") / 60000)),
+                Math.max(15, Math.round(ctx.helpers.parseDuration(params.hcEstimate ?? "4h") / 60000)),
                 hcWindowMin,
               );
 

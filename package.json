@@ -1,6 +1,6 @@
 {
   "name": "sowel-recipe-water-heater-smart",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Sowel recipe: Smart Water Heater — off-peak, solar surplus and hot-water floor",
   "type": "module",
   "main": "dist/index.js",

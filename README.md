@@ -34,10 +34,12 @@ L'asymétrie est voulue : conclure « plein » à tort laisse la maison sans eau
 
 En mode `late` (par défaut) la chauffe démarre à `hcEnd − durée estimée` : elle **finit** quand la plage se ferme, donc l'eau est au plus chaud au réveil et passe le moins de temps possible à refroidir dans le ballon.
 
-L'estimation part de `hcEstimate` puis se corrige :
+L'estimation part de `hcEstimate` (4 h par défaut) puis se corrige :
 
 - cycle terminé par une coupure du thermostat → lissage vers la durée mesurée + 20 min de marge ;
 - plage fermée sans jamais atteindre la coupure → l'estimation grandit de 45 min (on sait seulement que la vérité est *plus longue*).
+
+**L'apprentissage exige une mesure de puissance validée.** Sans elle, `hcEstimate` est utilisée telle quelle, indéfiniment : c'est elle qui détermine la chauffe de chaque nuit. Dans ce cas, voir large. Surestimer ne coûte que quelques cycles de régulation du thermostat du ballon en tarif creux ; sous-estimer donne de l'eau tiède au réveil, tous les jours, sans rien pour le corriger.
 
 ## Plafond physique sur le surplus
 

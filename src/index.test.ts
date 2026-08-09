@@ -483,6 +483,23 @@ describe("createInstance", () => {
     handle.stop();
   });
 
+  it("defaults to a 4 h heat-up, so an unlearned cycle still fills the tank", async () => {
+    // Without a power channel the estimate never learns, so the shipped
+    // default is what actually runs every night. 22:00→06:00 with 4 h puts
+    // the cycle at 02:00→06:00.
+    at("2026-08-09T22:05:00");
+    const h = buildHarness();
+    const { hcEstimate, maxCycle, ...defaults } = BASE_PARAMS;
+    void hcEstimate;
+    void maxCycle;
+    const handle = createRecipe().createInstance(defaults, h.ctx as never);
+    await advance(1);
+
+    expect(h.state.get("hcWindow")).toBe("02:00 → 06:00");
+    expect(h.orderCalls).toHaveLength(0); // not due yet at 22:05
+    handle.stop();
+  });
+
   it("starts the off-peak cycle once inside the computed heat window", async () => {
     at("2026-08-10T03:05:00");
     const h = buildHarness();

@@ -430,6 +430,9 @@ describe("createInstance", () => {
         { alias: "power", category: "power", value: 0 },
       ],
       drawWhenOn: 0, // relay closes but the thermostat is open → no draw
+      // An established install: the channel has already been seen carrying the
+      // heater, so a collapse to zero is trustworthy from the first cycle.
+      initialState: { powerProven: true },
     });
     const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
@@ -809,19 +812,90 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  it("treats a stale reading as no reading", async () => {
+  it("suspends the floor when the probe has gone quiet for too long", async () => {
     at("2026-08-09T16:00:00");
     const h = buildHarness({
       heaterBindings: [
         { alias: "state", category: "light_state", value: "OFF" },
-        { alias: "water_temperature", category: "temperature", value: 5, stale: true },
+        {
+          alias: "water_temperature",
+          category: "temperature",
+          value: 5,
+          stale: true,
+          lastUpdated: "2026-08-09 02:50:29Z", // 13 h old, like the real probe
+        },
         { alias: "power", category: "power", value: 0 },
       ],
     });
     const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(5);
 
-    expect(h.orderCalls).toHaveLength(0); // a stale 5 °C must not trigger a rescue
+    expect(h.orderCalls).toHaveLength(0); // a 13 h old 5 °C must not trigger a rescue
+    expect(h.logLines.some((l) => l.includes("muette"))).toBe(true);
+    handle.stop();
+  });
+
+  it("still trusts a sparse probe that core flags stale but is recent enough", async () => {
+    // Core marks `temperature` stale after 15 min. A tank does not cool in
+    // 20 min, so the reading is still actionable.
+    at("2026-08-09T16:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        {
+          alias: "water_temperature",
+          category: "temperature",
+          value: 12,
+          stale: true,
+          lastUpdated: "2026-08-09 15:40:00Z",
+        },
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("floor");
+    handle.stop();
+  });
+
+  it("refuses to declare the tank full while the power channel is unproven", async () => {
+    // Relay closes, nothing ever draws: could be a hot tank, could be a sensor
+    // watching the wrong circuit. Without proof, never conclude "full".
+    at("2026-08-09T16:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 18 },
+        { alias: "power", category: "power", value: 0 },
+      ],
+      drawWhenOn: 0,
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(20);
+
+    expect(h.state.get("tankFull")).toBe(false);
+    expect(h.state.get("relayOn")).toBe(true); // keeps trying rather than latching off
+    handle.stop();
+  });
+
+  it("proves the power channel on the first real draw, then trusts it", async () => {
+    at("2026-08-09T16:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 18 },
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(3); // relay closes, harness reports 2200 W
+    expect(h.state.get("powerProven")).toBe(true);
+
+    h.setBinding(HEATER, "power", 0);
+    await advance(6);
+    expect(h.state.get("tankFull")).toBe(true);
     handle.stop();
   });
 

@@ -104,6 +104,7 @@ interface DataBindingLite {
   category?: string;
   enumValues?: string[];
   stale?: boolean;
+  lastUpdated?: string | null;
 }
 
 interface OrderBindingLite {
@@ -196,6 +197,23 @@ const TANK_FULL_TTL_MS = 2 * 60 * 60 * 1000;
 /** Probe drop, in °C, that invalidates the `tankFull` latch — someone drew hot
  *  water, so the tank is no longer full whatever the latch says. */
 const DRAW_OFF_DELTA_C = 3;
+
+/**
+ * Fraction of the nominal power the channel must reach for the recipe to
+ * accept that it really is watching this heater.
+ *
+ * "Relay closed, no draw" has two readings: the thermostat is open (tank full)
+ * or the channel isn't measuring the heater at all — a wrong binding, a dead
+ * sensor, a relay that never closed. Within a single cycle they are
+ * indistinguishable, so the recipe refuses to conclude until it has seen the
+ * resistor pull *once*. After that the channel is proven and a collapse to
+ * zero can be trusted, including on a cycle that starts already cut off.
+ *
+ * The asymmetry is deliberate: concluding "full" wrongly leaves the household
+ * without hot water, while refusing to conclude only leaves a relay closed on
+ * a circuit that is drawing nothing.
+ */
+const CUTOFF_MIN_PEAK_RATIO = 0.5;
 
 /** Relay protection: never cycle faster than this. */
 const MIN_ON_MS = 5 * 60 * 1000;
@@ -420,6 +438,16 @@ function buildSlots(): RecipeSlotDef[] {
       group: "floor",
     },
     {
+      id: "tempMaxAge",
+      name: "Probe maximum age",
+      description:
+        "Beyond this, the probe reading is ignored and the floor is suspended. A tank changes slowly, so a sparse probe is still usable.",
+      type: "duration",
+      required: false,
+      defaultValue: "2h",
+      group: "floor",
+    },
+    {
       id: "rescueTemp",
       name: "Recovery temperature (°C)",
       description: "A rescue heat-up stops here. Must be above the minimum.",
@@ -614,6 +642,11 @@ const FR: RecipeLangPack = {
       name: "Température minimale (°C)",
       description: "En dessous, le chauffe-eau démarre immédiatement, quel que soit le tarif",
     },
+    tempMaxAge: {
+      name: "Âge maximal de la sonde",
+      description:
+        "Au-delà, la mesure est ignorée et le plancher est suspendu. Un ballon évolue lentement : une sonde qui remonte peu reste exploitable.",
+    },
     rescueTemp: {
       name: "Température de reprise (°C)",
       description: "Une chauffe de secours s'arrête ici. Doit être supérieure au minimum.",
@@ -777,6 +810,7 @@ export function createRecipe(): RecipeDefinition {
 
       const minTemp = toNumber(params.minTemp) ?? 20;
       const rescueTemp = toNumber(params.rescueTemp) ?? 25;
+      const tempMaxAgeMs = ctx.helpers.parseDuration(params.tempMaxAge ?? "2h") || 2 * 3600_000;
 
       const hcStartMin = hmToMinutes(String(params.hcStart));
       const hcEndMin = hmToMinutes(String(params.hcEnd));
@@ -817,6 +851,9 @@ export function createRecipe(): RecipeDefinition {
       let cycleStartedAt: number | null = null;
 
       let lowPowerSince: number | null = null;
+      let cyclePeakPower = 0;
+      /** Persisted: the power channel has been seen carrying the heater's draw. */
+      let powerProven = false;
       let surplusOkSince: number | null = null;
       let surplusLowSince: number | null = null;
       let mismatchSince: number | null = null;
@@ -848,11 +885,32 @@ export function createRecipe(): RecipeDefinition {
         return ctx.equipmentManager.getById(id)?.name ?? id.slice(0, 8);
       }
 
-      /** `null` value means "unusable" — missing, non-numeric or stale. */
-      function readNumeric(eq: EquipmentLite | null, alias: string): number | null {
+      /**
+       * `null` means "unusable" — missing, non-numeric, or too old.
+       *
+       * With `maxAgeMs`, freshness is judged on the binding's own age instead
+       * of core's `stale` flag. That flag uses a 15 min window for the
+       * `temperature` category, which is right for a room sensor and wrong for
+       * a tank: several hundred litres of water do not change temperature
+       * between two sparse reports from a battery probe. A reading two hours
+       * old still says something true about the tank; a twelve-hour-old one
+       * does not, and that is the distinction worth making.
+       */
+      function readNumeric(
+        eq: EquipmentLite | null,
+        alias: string,
+        maxAgeMs?: number,
+      ): number | null {
         if (!eq || !alias) return null;
         const b = eq.dataBindings.find((d) => d.alias === alias);
-        if (b) return b.stale === true ? null : toNumber(b.value);
+        if (b) {
+          if (maxAgeMs === undefined) return b.stale === true ? null : toNumber(b.value);
+          if (b.lastUpdated) {
+            const t = Date.parse(b.lastUpdated.replace(" ", "T"));
+            if (Number.isFinite(t) && Date.now() - t > maxAgeMs) return null;
+          }
+          return toNumber(b.value);
+        }
         const c = eq.computedData?.find((d) => d.alias === alias);
         return c ? toNumber(c.value) : null;
       }
@@ -995,8 +1053,23 @@ export function createRecipe(): RecipeDefinition {
       function snapshot(date: Date): Snapshot {
         const now = date.getTime();
         const eq = heaterEq();
-        const temp = tempKey ? readNumeric(eq, tempKey) : null;
+        const temp = tempKey ? readNumeric(eq, tempKey, tempMaxAgeMs) : null;
+        // Power keeps core's `stale` rule (2 min for the category): cut-off
+        // detection is only meaningful on a live reading.
         const power = powerKey ? readNumeric(eq, powerKey) : null;
+
+        if (tempKey) {
+          if (temp === null) {
+            warnOnce(
+              "temp-stale",
+              `Sonde "${tempKey}" muette depuis plus de ${ctx.helpers.formatDuration(
+                tempMaxAgeMs,
+              )} — plancher d'eau chaude suspendu jusqu'à son retour`,
+            );
+          } else {
+            warned.delete("temp-stale");
+          }
+        }
 
         const selfDraw =
           relayOn && (reason === "solar" || reason === "boost")
@@ -1100,6 +1173,7 @@ export function createRecipe(): RecipeDefinition {
           onSince = s.now;
           cycleStartedAt = s.now;
           lowPowerSince = null;
+          cyclePeakPower = 0;
           ctx.log(`Chauffe démarrée (${REASON_FR[desired]})`);
           return;
         }
@@ -1118,11 +1192,22 @@ export function createRecipe(): RecipeDefinition {
             );
           }
           if (!(await sendRelay("off"))) return;
+          // A whole cycle with the relay closed and no heating-level draw ever
+          // seen is a wiring/binding problem, not a hot tank — say so.
+          if (powerKey && !powerProven && onSince !== null && s.now - onSince > STARTUP_GRACE_MS) {
+            warnOnce(
+              "peak-never-seen",
+              `La mesure "${powerKey}" n'a jamais dépassé ${Math.round(
+                cyclePeakPower,
+              )} W pendant la chauffe (attendu ≈ ${heaterPowerW} W) — détection de coupure inactive tant qu'elle n'a pas vu le chauffe-eau consommer`,
+            );
+          }
           relayOn = false;
           reason = null;
           onSince = null;
           cycleStartedAt = null;
           lowPowerSince = null;
+          cyclePeakPower = 0;
           offSince = s.now;
           ctx.log(`Chauffe arrêtée (${previous ? REASON_FR[previous] : "?"})`);
           return;
@@ -1171,14 +1256,32 @@ export function createRecipe(): RecipeDefinition {
         }
       }
 
-      /** Thermostat cut-off: relay closed, warm-up grace elapsed, no draw. */
+      /**
+       * Thermostat cut-off: relay closed, warm-up grace elapsed, no draw.
+       *
+       * The cycle peak gates the whole thing. "Tank full" is only credible as
+       * the *end* of a draw we actually witnessed — a channel that never rose
+       * to heating levels is measuring something other than this heater, and
+       * concluding "full" from it would wedge the recipe into doing nothing.
+       */
       function detectCutoff(s: Snapshot): void {
         if (!relayOn || onSince === null) {
           lowPowerSince = null;
+          cyclePeakPower = 0;
           return;
         }
         if (!powerKey || s.power === null) return;
+        if (s.power > cyclePeakPower) cyclePeakPower = s.power;
+        if (!powerProven && cyclePeakPower >= heaterPowerW * CUTOFF_MIN_PEAK_RATIO) {
+          powerProven = true;
+          ctx.state.set("powerProven", true);
+          ctx.log(`Mesure "${powerKey}" validée — ${Math.round(cyclePeakPower)} W observés en chauffe`);
+        }
         if (s.now - onSince < STARTUP_GRACE_MS) return;
+        if (!powerProven) {
+          lowPowerSince = null;
+          return;
+        }
 
         if (s.power >= cutoffPower) {
           lowPowerSince = null;
@@ -1236,6 +1339,7 @@ export function createRecipe(): RecipeDefinition {
           lastFullCycleAt ? new Date(lastFullCycleAt).toISOString() : null,
         );
         ctx.state.set("mode", mode);
+        ctx.state.set("powerProven", powerProven);
       }
 
       function publish(s: Snapshot): void {
@@ -1290,6 +1394,8 @@ export function createRecipe(): RecipeDefinition {
                 Math.max(15, Math.round(ctx.helpers.parseDuration(params.hcEstimate ?? "3h") / 60000)),
                 hcWindowMin,
               );
+
+        powerProven = ctx.state.get("powerProven") === true;
 
         const storedMode = ctx.state.get("mode");
         mode = storedMode === "boost" || storedMode === "off" ? storedMode : "auto";

@@ -20,6 +20,16 @@ Le ballon n'expose pas de consigne haute exploitable : son thermostat s'ouvre to
 
 La sonde du bas ne peut pas jouer ce rôle : par stratification, elle lit froid pendant que le haut du ballon est à 60 °C. C'est exactement pour ça que la puissance est le capteur principal ici, et la sonde ne garde que le plancher.
 
+### La mesure doit d'abord faire ses preuves
+
+« Relais fermé, aucune consommation » a deux lectures : le thermostat est ouvert (ballon plein), ou la mesure ne regarde pas le bon circuit (mauvais binding, capteur mort, relais qui n'a pas collé). Dans un seul cycle, les deux sont indiscernables.
+
+La recette refuse donc de conclure tant qu'elle n'a pas vu la résistance tirer **au moins une fois** au moins la moitié de sa puissance nominale. Une fois le canal validé (`powerProven`, persistant), une chute à zéro devient digne de confiance — y compris sur un cycle qui démarre déjà coupé.
+
+L'asymétrie est voulue : conclure « plein » à tort laisse la maison sans eau chaude, refuser de conclure laisse seulement un relais fermé sur un circuit qui ne consomme rien.
+
+**Conséquence pratique** : la mesure doit porter sur le chauffe-eau lui-même. Un compteur général ne convient pas — après la coupure du thermostat, la consommation résiduelle du logement reste au-dessus de `cutoffPower` et la coupure ne serait jamais vue.
+
 ## Le cycle nocturne apprend sa durée
 
 En mode `late` (par défaut) la chauffe démarre à `hcEnd − durée estimée` : elle **finit** quand la plage se ferme, donc l'eau est au plus chaud au réveil et passe le moins de temps possible à refroidir dans le ballon.
@@ -43,7 +53,9 @@ Pastille cliquable sur la ligne de la recette : **Auto** → **Boost** (chauffe 
 | --- | --- |
 | Pas de sonde (`tempKey` vide) | Plancher désactivé, HC + solaire fonctionnent |
 | Pas de mesure de puissance (`powerKey` vide) | Pas de détection de coupure : les cycles sont bornés par la plage et `maxCycle` |
-| Donnée périmée (`stale`) | Traitée comme absente — une vieille valeur ne déclenche rien |
+| Sonde qui remonte peu | Jugée sur son âge réel (`tempMaxAge`, 2 h par défaut), pas sur le flag `stale` de Sowel (15 min) : un ballon de plusieurs centaines de litres ne change pas de température entre deux remontées espacées |
+| Sonde muette au-delà de `tempMaxAge` | Plancher suspendu, avertissement dans le journal, reprise automatique au retour de la sonde |
+| Mesure de puissance périmée | Traitée comme absente — la détection de coupure exige une valeur vivante |
 | Chauffe-eau allumé à la main | La recette se retire et n'envoie plus d'ordre jusqu'à extinction |
 | Redémarrage de l'instance | Le cycle en cours reprend avec son heure de départ d'origine, le relais n'est pas interrompu |
 

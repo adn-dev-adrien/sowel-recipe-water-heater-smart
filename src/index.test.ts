@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   createRecipe,
   computeHcHeatWindow,
+  pickMainOffPeakSlot,
   computeSurplus,
   findOnOffOrderAlias,
   hmToMinutes,
@@ -38,6 +39,17 @@ interface HarnessOptions {
   deviceObeys?: boolean;
   /** Pre-existing recipe state, as if restored from a previous instance. */
   initialState?: Record<string, unknown>;
+  /**
+   * Tariff snapshot the fake core hands back. `undefined` models a Sowel older
+   * than 1.36, where `ctx.helpers.getTariff` does not exist at all.
+   */
+  tariff?: {
+    configured: boolean;
+    offPeakToday: { start: string; end: string; tariff: string }[];
+    isOffPeakNow: boolean | null;
+  };
+  /** Makes getTariff() throw, to prove a broken core cannot break the recipe. */
+  tariffThrows?: boolean;
 }
 
 function buildHarness(opts: HarnessOptions = {}) {
@@ -120,6 +132,14 @@ function buildHarness(opts: HarnessOptions = {}) {
     helpers: {
       parseDuration: (value: unknown) => parseDurationLike(value),
       formatDuration: (ms: number) => `${Math.round(ms / 60000)}min`,
+      ...(opts.tariff !== undefined || opts.tariffThrows
+        ? {
+            getTariff: () => {
+              if (opts.tariffThrows) throw new Error("classifier exploded");
+              return opts.tariff!;
+            },
+          }
+        : {}),
     },
     dispatchOrder: async (equipmentId: string, alias: string, value: unknown) => {
       orderCalls.push({ equipmentId, alias, value });
@@ -251,6 +271,37 @@ describe("computeHcHeatWindow", () => {
     const w = computeHcHeatWindow(hcStart, hcEnd, "late", 900);
     expect(minutesToHm(w.startMin)).toBe("22:00");
     expect(minutesToHm(w.endMin)).toBe("06:00");
+  });
+});
+
+describe("pickMainOffPeakSlot", () => {
+  it("returns null when there is nothing usable", () => {
+    expect(pickMainOffPeakSlot([])).toBeNull();
+    expect(pickMainOffPeakSlot([{ start: "nope", end: "06:00" }])).toBeNull();
+  });
+
+  it("takes the longest slot — the one with room for a full tank", () => {
+    expect(
+      pickMainOffPeakSlot([
+        { start: "13:00", end: "16:00" }, // 3 h midday
+        { start: "22:00", end: "06:00" }, // 8 h night
+      ]),
+    ).toEqual({ startMin: 1320, endMin: 360 });
+  });
+
+  it("keeps the first declared on a tie", () => {
+    expect(
+      pickMainOffPeakSlot([
+        { start: "02:00", end: "06:00" },
+        { start: "13:00", end: "17:00" },
+      ]),
+    ).toEqual({ startMin: 120, endMin: 360 });
+  });
+
+  it("skips malformed entries rather than failing", () => {
+    expect(
+      pickMainOffPeakSlot([{ start: "25:00", end: "06:00" }, { start: "23:00", end: "05:00" }]),
+    ).toEqual({ startMin: 1380, endMin: 300 });
   });
 });
 
@@ -551,6 +602,125 @@ describe("createInstance", () => {
     // Never had a full cycle → forced to "full", so heating starts right away.
     expect(h.state.get("hcWindow")).toBe("22:00 → 06:00");
     expect(h.lastOrder()).toMatchObject({ value: true });
+    handle.stop();
+  });
+
+  // ── 2b. Off-peak hours read from the instance tariff ─────
+
+  const NIGHT_TARIFF = {
+    configured: true,
+    offPeakToday: [{ start: "23:00", end: "07:00", tariff: "hc" }],
+    isOffPeakNow: false,
+  };
+
+  it("takes the off-peak hours from the instance tariff instead of the slots", async () => {
+    // Slots say 22:00→06:00, the tariff says 23:00→07:00. With a 3 h estimate
+    // and `late` placement, the tariff wins: 04:00→07:00, not 03:00→06:00.
+    at("2026-08-09T22:30:00");
+    const h = buildHarness({ tariff: NIGHT_TARIFF });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.state.get("hcWindow")).toBe("04:00 → 07:00");
+    expect(h.state.get("hcSource")).toBe("tariff");
+    handle.stop();
+  });
+
+  it("heats on the tariff window, not on the stale slot values", async () => {
+    // 06:30 is outside the recipe's own 22:00→06:00 slots but inside the
+    // tariff's 23:00→07:00 heat window.
+    at("2026-08-10T06:30:00");
+    const h = buildHarness({ tariff: NIGHT_TARIFF });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("hc");
+    handle.stop();
+  });
+
+  it("falls back to the slots on a core with no tariff helper", async () => {
+    at("2026-08-09T22:30:00");
+    const h = buildHarness(); // no getTariff at all — Sowel < 1.36
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
+    expect(h.state.get("hcSource")).toBe("manual");
+    expect(h.logLines.some((l) => l.includes("n'expose pas les heures creuses"))).toBe(true);
+    handle.stop();
+  });
+
+  it("falls back to the slots when no tariff is configured", async () => {
+    at("2026-08-09T22:30:00");
+    const h = buildHarness({
+      tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
+    expect(h.state.get("hcSource")).toBe("manual");
+    expect(h.logLines.some((l) => l.includes("Aucun tarif configuré"))).toBe(true);
+    handle.stop();
+  });
+
+  it("falls back to the slots on a day the schedule does not cover", async () => {
+    at("2026-08-09T22:30:00");
+    const h = buildHarness({
+      tariff: { configured: true, offPeakToday: [], isOffPeakNow: false },
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.state.get("hcSource")).toBe("manual");
+    expect(h.logLines.some((l) => l.includes("aucune heure creuse aujourd'hui"))).toBe(true);
+    handle.stop();
+  });
+
+  it("survives a core whose tariff read throws", async () => {
+    at("2026-08-09T22:30:00");
+    const h = buildHarness({ tariffThrows: true });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(2);
+
+    expect(h.state.get("hcSource")).toBe("manual");
+    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
+    expect(h.logLines.some((l) => l.includes("Lecture du tarif Sowel impossible"))).toBe(true);
+    handle.stop();
+  });
+
+  it("ignores the tariff when the user pins the hours manually", async () => {
+    at("2026-08-09T22:30:00");
+    const h = buildHarness({ tariff: NIGHT_TARIFF });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, hcSource: "manual" },
+      h.ctx as never,
+    );
+    await advance(1);
+
+    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
+    expect(h.state.get("hcSource")).toBe("manual");
+    handle.stop();
+  });
+
+  it("picks the night slot when the tariff declares several", async () => {
+    at("2026-08-09T22:30:00");
+    const h = buildHarness({
+      tariff: {
+        configured: true,
+        offPeakToday: [
+          { start: "13:00", end: "16:00", tariff: "hc" },
+          { start: "23:00", end: "07:00", tariff: "hc" },
+        ],
+        isOffPeakNow: false,
+      },
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.state.get("hcWindow")).toBe("04:00 → 07:00");
+    expect(h.logLines.some((l) => l.includes("2 plages"))).toBe(true);
     handle.stop();
   });
 

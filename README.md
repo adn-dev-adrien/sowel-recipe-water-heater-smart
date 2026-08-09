@@ -30,6 +30,14 @@ L'asymétrie est voulue : conclure « plein » à tort laisse la maison sans eau
 
 **Conséquence pratique** : la mesure doit porter sur le chauffe-eau lui-même. Un compteur général ne convient pas — après la coupure du thermostat, la consommation résiduelle du logement reste au-dessus de `cutoffPower` et la coupure ne serait jamais vue.
 
+## Les heures creuses viennent de Sowel
+
+L'instance connaît déjà tes heures creuses : elles sont saisies une fois sous **Réglages → Administration → Tarif d'énergie** et pilotent la facturation énergie. Les redemander dans la recette dupliquerait une configuration qui dérive ensuite en silence — tu changes la page tarifs, la recette continue sur les anciennes heures, sans rien pour le signaler.
+
+Le slot `hcSource` vaut `auto` par défaut : la recette lit `ctx.helpers.getTariff()` (Sowel ≥ 1.36, spec 138) et se replie sur les heures saisies dans la recette dès que ce n'est pas exploitable — core plus ancien, aucun tarif configuré, ou un jour que le calendrier ne couvre pas. Le repli est journalisé, et la source en vigueur est visible dans l'état de l'instance (`hcSource`).
+
+La plage est résolue à chaque évaluation, pas mise en cache au démarrage : modifier la page tarifs prend effet sans toucher à l'instance. Si le tarif déclare plusieurs plages creuses (nuit + midi), la recette prend **la plus longue** — celle qui a la place pour une chauffe complète — et le signale dans le journal.
+
 ## Le cycle nocturne apprend sa durée
 
 En mode `late` (par défaut) la chauffe démarre à `hcEnd − durée estimée` : elle **finit** quand la plage se ferme, donc l'eau est au plus chaud au réveil et passe le moins de temps possible à refroidir dans le ballon.

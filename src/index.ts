@@ -148,7 +148,16 @@ interface RecipeContext {
   };
   state: RecipeStateStore;
   log: (message: string, level?: "info" | "warn" | "error") => void;
-  helpers: { parseDuration(value: unknown): number; formatDuration(ms: number): string };
+  helpers: {
+    parseDuration(value: unknown): number;
+    formatDuration(ms: number): string;
+    /** Spec 138, Sowel ≥ 1.36 — absent on older cores, hence optional. */
+    getTariff?(): {
+      configured: boolean;
+      offPeakToday: { start: string; end: string; tariff: string }[];
+      isOffPeakNow: boolean | null;
+    };
+  };
   dispatchOrder(
     equipmentId: string,
     alias: string,
@@ -322,6 +331,27 @@ export function learnEstimate(
  * `production_only` has no such feedback (production is unaffected by the
  * heater), so `selfDraw` is ignored.
  */
+/**
+ * Pick the night window out of the instance's configured off-peak slots.
+ *
+ * A tariff may declare several HC slots (a night one plus a midday one, say).
+ * This recipe drives a single bulk heat-up, so it takes the longest slot —
+ * that is the one with room for a full tank. Ties keep the first declared.
+ */
+export function pickMainOffPeakSlot(
+  slots: { start: string; end: string }[],
+): { startMin: number; endMin: number } | null {
+  let best: { startMin: number; endMin: number; len: number } | null = null;
+  for (const s of slots) {
+    if (!isValidHHMM(s.start) || !isValidHHMM(s.end)) continue;
+    const startMin = hmToMinutes(s.start);
+    const endMin = hmToMinutes(s.end);
+    const len = windowLength(startMin, endMin);
+    if (!best || len > best.len) best = { startMin, endMin, len };
+  }
+  return best ? { startMin: best.startMin, endMin: best.endMin } : null;
+}
+
 export function computeSurplus(
   mode: "off" | "grid_injection" | "production_only",
   reading: number | null,
@@ -466,9 +496,23 @@ function buildSlots(): RecipeSlotDef[] {
     },
 
     {
+      id: "hcSource",
+      name: "Off-peak hours source",
+      description:
+        "Read the hours from the instance's energy tariff (Settings → Administration), or use the times below. Automatic falls back to the times below when no tariff is configured.",
+      type: "select",
+      required: false,
+      defaultValue: "auto",
+      options: [
+        { value: "auto", label: "Sowel energy tariff (recommended)" },
+        { value: "manual", label: "Times set here" },
+      ],
+      group: "hc",
+    },
+    {
       id: "hcStart",
       name: "Off-peak start",
-      description: "Beginning of the cheap-tariff window",
+      description: "Beginning of the cheap-tariff window. Used as the fallback in automatic mode.",
       type: "time",
       required: true,
       defaultValue: "22:00",
@@ -661,7 +705,19 @@ const FR: RecipeLangPack = {
       name: "Température de reprise (°C)",
       description: "Une chauffe de secours s'arrête ici. Doit être supérieure au minimum.",
     },
-    hcStart: { name: "Début heures creuses", description: "Début de la plage tarifaire basse" },
+    hcSource: {
+      name: "Source des heures creuses",
+      description:
+        "Lire les heures depuis le tarif d'énergie de l'instance (Réglages → Administration), ou utiliser les heures ci-dessous. Le mode automatique bascule sur les heures ci-dessous si aucun tarif n'est configuré.",
+      options: {
+        auto: "Tarif d'énergie Sowel (recommandé)",
+        manual: "Heures saisies ici",
+      },
+    },
+    hcStart: {
+      name: "Début heures creuses",
+      description: "Début de la plage tarifaire basse. Sert de repli en mode automatique.",
+    },
     hcEnd: { name: "Fin heures creuses", description: "Fin de la plage tarifaire basse" },
     hcMode: {
       name: "Placement du cycle",
@@ -825,9 +881,9 @@ export function createRecipe(): RecipeDefinition {
       const rescueTemp = toNumber(params.rescueTemp) ?? 25;
       const tempMaxAgeMs = ctx.helpers.parseDuration(params.tempMaxAge ?? "2h") || 2 * 3600_000;
 
-      const hcStartMin = hmToMinutes(String(params.hcStart));
-      const hcEndMin = hmToMinutes(String(params.hcEnd));
-      const hcWindowMin = windowLength(hcStartMin, hcEndMin);
+      const manualStartMin = hmToMinutes(String(params.hcStart));
+      const manualEndMin = hmToMinutes(String(params.hcEnd));
+      const hcSource = params.hcSource === "manual" ? "manual" : "auto";
       const hcMode = (["late", "early", "full"] as const).includes(params.hcMode as never)
         ? (params.hcMode as "late" | "early" | "full")
         : "late";
@@ -1008,7 +1064,7 @@ export function createRecipe(): RecipeDefinition {
         if (cycleStartedAt !== null) {
           const measured = Math.max(0, Math.round((endedAt - cycleStartedAt) / 60000));
           if (reason === "hc" || reason === "boost") {
-            hcEstimateMin = learnEstimate(hcEstimateMin, measured, true, hcWindowMin);
+            hcEstimateMin = learnEstimate(hcEstimateMin, measured, true, currentWindowMin());
           }
           ctx.log(
             `Ballon chaud — thermostat coupé après ${measured} min (${
@@ -1036,6 +1092,101 @@ export function createRecipe(): RecipeDefinition {
         return true;
       }
 
+      // ── Off-peak window ───────────────────────────────────
+
+      /**
+       * Where the off-peak hours come from.
+       *
+       * The instance already knows them: they are configured once under
+       * Settings → Administration → Energy tariff and drive energy billing.
+       * Asking for them again in slots duplicates configuration that then
+       * drifts — change the tariff page and the recipe keeps the old hours.
+       *
+       * So `auto` reads `ctx.helpers.getTariff()` (Sowel ≥ 1.36, spec 138) and
+       * falls back to the slots whenever that is unavailable: older core, no
+       * tariff configured, or a day the schedule does not cover. Resolved on
+       * every evaluation rather than cached at start, so an edit to the tariff
+       * page takes effect without touching the instance.
+       */
+      function resolveHcWindow(): {
+        startMin: number;
+        endMin: number;
+        source: "tariff" | "manual";
+      } {
+        const manual = {
+          startMin: manualStartMin,
+          endMin: manualEndMin,
+          source: "manual" as const,
+        };
+        if (hcSource === "manual") return manual;
+
+        const read = ctx.helpers.getTariff;
+        if (typeof read !== "function") {
+          warnOnce(
+            "no-tariff-helper",
+            "Cette version de Sowel n'expose pas les heures creuses aux recettes — utilisation des heures saisies dans la recette",
+          );
+          return manual;
+        }
+
+        try {
+          const tariff = read();
+          if (!tariff.configured) {
+            warnOnce(
+              "tariff-unconfigured",
+              "Aucun tarif configuré dans Sowel (Réglages → Administration → Tarif d'énergie) — utilisation des heures saisies dans la recette",
+            );
+            return manual;
+          }
+          const picked = pickMainOffPeakSlot(tariff.offPeakToday);
+          if (!picked) {
+            warnOnce(
+              "tariff-no-slot-today",
+              "Le tarif Sowel ne déclare aucune heure creuse aujourd'hui — utilisation des heures saisies dans la recette",
+            );
+            return manual;
+          }
+          warned.delete("tariff-unconfigured");
+          warned.delete("tariff-no-slot-today");
+          if (tariff.offPeakToday.length > 1) {
+            warnOnce(
+              "tariff-multi-slot",
+              `${tariff.offPeakToday.length} plages d'heures creuses configurées — la recette utilise la plus longue (${minutesToHm(
+                picked.startMin,
+              )}→${minutesToHm(picked.endMin)})`,
+            );
+          }
+          return { ...picked, source: "tariff" };
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          warnOnce("tariff-read-failed", `Lecture du tarif Sowel impossible (${msg}) — repli sur les heures de la recette`);
+          return manual;
+        }
+      }
+
+      /** Length of the off-peak window currently in force — the ceiling the
+       *  learned duration is clamped to. */
+      function currentWindowMin(): number {
+        const w = resolveHcWindow();
+        return windowLength(w.startMin, w.endMin);
+      }
+
+      /** Logged once per change so the journal shows which hours are in force. */
+      let lastWindowLabel: string | null = null;
+      function announceWindow(w: {
+        startMin: number;
+        endMin: number;
+        source: "tariff" | "manual";
+      }): void {
+        const label = `${minutesToHm(w.startMin)}→${minutesToHm(w.endMin)} (${
+          w.source === "tariff" ? "tarif Sowel" : "réglage recette"
+        })`;
+        if (label === lastWindowLabel) return;
+        if (lastWindowLabel !== null) ctx.log(`Heures creuses : ${label}`);
+        lastWindowLabel = label;
+        ctx.state.set("hcSource", w.source);
+      }
+
       // ── Off-peak placement ────────────────────────────────
 
       /** A forced full cycle (anti-legionella) overrides the placement for the
@@ -1048,7 +1199,9 @@ export function createRecipe(): RecipeDefinition {
 
       function hcHeatWindow(now: number): { startMin: number; endMin: number } {
         const effective = needsFullCycle(now) ? "full" : hcMode;
-        return computeHcHeatWindow(hcStartMin, hcEndMin, effective, hcEstimateMin);
+        const w = resolveHcWindow();
+        announceWindow(w);
+        return computeHcHeatWindow(w.startMin, w.endMin, effective, hcEstimateMin);
       }
 
       // ── Decision ──────────────────────────────────────────
@@ -1112,6 +1265,7 @@ export function createRecipe(): RecipeDefinition {
         }
 
         const nMin = nowMinutes(date);
+        const hcWindow = resolveHcWindow();
         const heat = hcHeatWindow(now);
         return {
           now,
@@ -1119,7 +1273,7 @@ export function createRecipe(): RecipeDefinition {
           temp,
           power,
           surplus,
-          inHc: isWithinWindow(nMin, hcStartMin, hcEndMin),
+          inHc: isWithinWindow(nMin, hcWindow.startMin, hcWindow.endMin),
           inHcHeat: isWithinWindow(nMin, heat.startMin, heat.endMin),
         };
       }
@@ -1229,7 +1383,7 @@ export function createRecipe(): RecipeDefinition {
             powerKey &&
             powerProven
           ) {
-            hcEstimateMin = learnEstimate(hcEstimateMin, 0, false, hcWindowMin);
+            hcEstimateMin = learnEstimate(hcEstimateMin, 0, false, currentWindowMin());
             ctx.log(
               `Fin de plage sans coupure du thermostat — estimation portée à ${hcEstimateMin} min`,
             );
@@ -1432,10 +1586,10 @@ export function createRecipe(): RecipeDefinition {
         const storedEstimate = num("hcEstimateMin");
         hcEstimateMin =
           storedEstimate !== null && storedEstimate > 0
-            ? Math.min(storedEstimate, hcWindowMin)
+            ? Math.min(storedEstimate, currentWindowMin())
             : Math.min(
                 Math.max(15, Math.round(ctx.helpers.parseDuration(params.hcEstimate ?? "4h") / 60000)),
-                hcWindowMin,
+                currentWindowMin(),
               );
 
         powerProven = ctx.state.get("powerProven") === true;
@@ -1468,15 +1622,17 @@ export function createRecipe(): RecipeDefinition {
       const ticker = setInterval(() => void evaluate(), TICK_MS);
 
       const heaterName = nameOf(heaterId);
+      const startupWindow = resolveHcWindow();
+      announceWindow(startupWindow);
       const capabilities = [
         tempKey ? `sonde ${tempKey}` : "sans sonde (plancher désactivé)",
         powerKey ? `puissance ${powerKey}` : "sans mesure de puissance (détection de coupure désactivée)",
         solarMode === "off" ? "sans solaire" : `solaire ${solarMode} via ${nameOf(solarSourceId)}`,
       ].join(", ");
       ctx.log(
-        `Recette démarrée sur ${heaterName} — HC ${minutesToHm(hcStartMin)}→${minutesToHm(
-          hcEndMin,
-        )} (${hcMode}), plancher ${minTemp}→${rescueTemp} °C, ${capabilities}`,
+        `Recette démarrée sur ${heaterName} — HC ${minutesToHm(startupWindow.startMin)}→${minutesToHm(
+          startupWindow.endMin,
+        )} (${startupWindow.source === "tariff" ? "tarif Sowel" : "réglage recette"}, ${hcMode}), plancher ${minTemp}→${rescueTemp} °C, ${capabilities}`,
       );
       if (!tempKey) {
         warnOnce(

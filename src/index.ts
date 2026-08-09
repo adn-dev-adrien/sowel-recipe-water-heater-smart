@@ -327,11 +327,18 @@ export function computeSurplus(
   reading: number | null,
   gridSign: "import_positive" | "import_negative",
   selfDraw: number,
+  productionW: number | null = null,
 ): number | null {
   if (mode === "off" || reading === null) return null;
   if (mode === "production_only") return reading;
   const exported = gridSign === "import_positive" ? -reading : reading;
-  return exported + selfDraw;
+  const surplus = exported + selfDraw;
+  // Physical ceiling: without storage, a house cannot export more than it
+  // produces. When a production meter is available this caps a mis-signed or
+  // mis-wired grid clamp — the failure mode that would otherwise run 2.2 kW
+  // off the grid at peak price.
+  if (productionW === null) return surplus;
+  return Math.min(surplus, productionW);
 }
 
 function toNumber(value: unknown): number | null {
@@ -542,11 +549,12 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "productionEquipment",
       name: "Production meter",
-      description: "Photovoltaic production meter",
+      description:
+        "Photovoltaic production. Required in production-only mode; in grid-meter mode it is an optional safety cap — export can never exceed production.",
       type: "equipment",
       required: false,
       constraints: { equipmentType: PRODUCTION_TYPES, crossZone: true },
-      hiddenWhen: { slot: "solarMode", equals: ["off", "grid_injection"] },
+      hiddenWhen: { slot: "solarMode", equals: "off" },
       group: "solar",
     },
     {
@@ -692,7 +700,8 @@ const FR: RecipeLangPack = {
     },
     productionEquipment: {
       name: "Compteur de production",
-      description: "Compteur de production photovoltaïque",
+      description:
+        "Production photovoltaïque. Obligatoire en mode production seule ; en mode compteur général, c'est un garde-fou optionnel — on ne peut jamais injecter plus qu'on ne produit.",
     },
     surplusMargin: {
       name: "Marge de surplus (W)",
@@ -1078,7 +1087,25 @@ export function createRecipe(): RecipeDefinition {
         const raw = solarSourceId
           ? readFirstNumeric(ctx.equipmentManager.getByIdWithDetails(solarSourceId), POWER_ALIASES)
           : null;
-        const surplus = computeSurplus(solarMode, raw, gridSign, selfDraw);
+        // In grid_injection mode a production meter is optional but valuable:
+        // it turns an un-verifiable sign convention into a bounded one.
+        const productionW =
+          solarMode === "grid_injection" && productionId
+            ? readFirstNumeric(ctx.equipmentManager.getByIdWithDetails(productionId), POWER_ALIASES)
+            : null;
+        const surplus = computeSurplus(solarMode, raw, gridSign, selfDraw, productionW);
+
+        if (productionW !== null && raw !== null) {
+          const uncapped = (gridSign === "import_positive" ? -raw : raw) + selfDraw;
+          if (uncapped > productionW + heaterPowerW) {
+            warnOnce(
+              "sign-suspect",
+              `Injection annoncée (${Math.round(uncapped)} W) très supérieure à la production (${Math.round(
+                productionW,
+              )} W) — convention de signe du compteur probablement inversée. Surplus plafonné à la production.`,
+            );
+          }
+        }
 
         const nMin = nowMinutes(date);
         const heat = hcHeatWindow(now);

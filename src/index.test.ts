@@ -17,6 +17,7 @@ import {
 
 const HEATER = "heater-1";
 const METER = "meter-1";
+const PRODUCTION = "production-1";
 
 type Binding = {
   alias: string;
@@ -69,6 +70,14 @@ function buildHarness(opts: HarnessOptions = {}) {
       type: "main_energy_meter",
       status: "online",
       dataBindings: meterBindings,
+      orderBindings: [],
+    },
+    [PRODUCTION]: {
+      id: PRODUCTION,
+      name: "Solaire",
+      type: "energy_production_meter",
+      status: "online",
+      dataBindings: [{ alias: "power", category: "power", value: 0 }] as Binding[],
       orderBindings: [],
     },
   };
@@ -288,6 +297,19 @@ describe("computeSurplus", () => {
 
   it("ignores the self-draw term in production-only mode", () => {
     expect(computeSurplus("production_only", 2500, "import_positive", 2200)).toBe(2500);
+  });
+
+  it("caps the surplus at production — a house cannot export what it never made", () => {
+    // Sign convention inverted: the meter says "exporting 3 kW" at night.
+    expect(computeSurplus("grid_injection", -3000, "import_positive", 0, 0)).toBe(0);
+    // Genuine surplus, below production: left untouched.
+    expect(computeSurplus("grid_injection", -1500, "import_positive", 0, 4000)).toBe(1500);
+    // Claimed export above production: clamped to what the panels deliver.
+    expect(computeSurplus("grid_injection", -5000, "import_positive", 0, 3000)).toBe(3000);
+  });
+
+  it("leaves a negative surplus negative when capping", () => {
+    expect(computeSurplus("grid_injection", 1200, "import_positive", 0, 0)).toBe(-1200);
   });
 });
 
@@ -632,6 +654,43 @@ describe("createInstance", () => {
 
     await advance(3);
     expect(h.lastOrder()).toMatchObject({ value: false });
+    handle.stop();
+  });
+
+  it("refuses to heat on a mis-signed meter when production contradicts it", async () => {
+    // Evening: the grid clamp claims a 3 kW export while the panels make
+    // nothing. The production cap turns a costly mistake into a no-op.
+    at("2026-08-09T20:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, productionEquipment: PRODUCTION },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -3000);
+    h.setBinding(PRODUCTION, "power", 0);
+    await advance(10);
+
+    expect(h.orderCalls).toHaveLength(0);
+    expect(h.state.get("surplus")).toBe(0);
+    expect(h.logLines.some((l) => l.includes("signe"))).toBe(true);
+    handle.stop();
+  });
+
+  it("heats normally when production backs the announced export", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, productionEquipment: PRODUCTION },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -2500);
+    h.setBinding(PRODUCTION, "power", 4000);
+    await advance(4);
+
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("solar");
     handle.stop();
   });
 

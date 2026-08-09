@@ -39,6 +39,12 @@ L'estimation part de `hcEstimate` puis se corrige :
 - cycle terminé par une coupure du thermostat → lissage vers la durée mesurée + 20 min de marge ;
 - plage fermée sans jamais atteindre la coupure → l'estimation grandit de 45 min (on sait seulement que la vérité est *plus longue*).
 
+## Plafond physique sur le surplus
+
+En mode compteur général, renseigner aussi le compteur de production active un garde-fou : **on ne peut pas injecter plus qu'on ne produit**. Le surplus est plafonné à la production instantanée, et un écart aberrant déclenche un avertissement dans le journal.
+
+C'est la protection contre le scénario coûteux : une pince mal orientée ou une convention de signe inversée fait lire « j'injecte 3 kW » alors qu'on soutire — et la recette allumerait 2,2 kW en heure pleine. Avec le plafond, production nulle signifie surplus nul, quoi que raconte le compteur.
+
 ## Anti-oscillation solaire
 
 Dès que le relais se ferme, le chauffe-eau mange 2,2 kW et l'injection tombe à zéro — un asservissement naïf se couperait aussitôt. La loi de commande **réinjecte la consommation du chauffe-eau dans le surplus** tant qu'il tourne pour cette raison, et les deux fronts sont temporisés (`surplusStartDelay` / `surplusStopDelay`) pour encaisser les passages nuageux.

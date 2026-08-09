@@ -1,0 +1,62 @@
+# sowel-recipe-water-heater-smart
+
+Recette Sowel pour piloter un **chauffe-eau électrique** derrière un simple relais marche/arrêt (Zigbee, Tasmota, …), sans consigne de température : c'est le thermostat mécanique du ballon qui décide de la température finale, la recette décide seulement **quand** la résistance a le droit de consommer.
+
+## Ce que ça fait
+
+Trois raisons de chauffer, par priorité décroissante :
+
+| Priorité | Motif | Déclencheur | Arrêt |
+| --- | --- | --- | --- |
+| 1 | **Plancher d'eau chaude** | Sonde bas de ballon sous `minTemp` | `rescueTemp` atteinte, ou coupure du thermostat |
+| 2 | **Heures creuses** | Fenêtre HC, cycle calé en fin de plage | Coupure du thermostat, ou fin de plage |
+| 3 | **Surplus solaire** | Export ≥ puissance + marge, confirmé | Export perdu, confirmé, ou coupure du thermostat |
+
+Le plancher passe avant tout : au gîte, une série de douches en pleine journée vide le ballon hors heures creuses et sans soleil — la recette rechauffe quand même, le prix du kWh ne vaut pas de l'eau froide.
+
+## Détection « ballon plein »
+
+Le ballon n'expose pas de consigne haute exploitable : son thermostat s'ouvre tout seul quand l'eau est chaude. Ça se voit sur la **puissance mesurée**, qui s'effondre de ~2,2 kW à ~0 W alors que le relais est toujours fermé. Maintenu pendant `cutoffDelay`, ça vaut « ballon plein » → le relais s'ouvre et le cycle sert à affiner l'estimation de durée.
+
+La sonde du bas ne peut pas jouer ce rôle : par stratification, elle lit froid pendant que le haut du ballon est à 60 °C. C'est exactement pour ça que la puissance est le capteur principal ici, et la sonde ne garde que le plancher.
+
+## Le cycle nocturne apprend sa durée
+
+En mode `late` (par défaut) la chauffe démarre à `hcEnd − durée estimée` : elle **finit** quand la plage se ferme, donc l'eau est au plus chaud au réveil et passe le moins de temps possible à refroidir dans le ballon.
+
+L'estimation part de `hcEstimate` puis se corrige :
+
+- cycle terminé par une coupure du thermostat → lissage vers la durée mesurée + 20 min de marge ;
+- plage fermée sans jamais atteindre la coupure → l'estimation grandit de 45 min (on sait seulement que la vérité est *plus longue*).
+
+## Anti-oscillation solaire
+
+Dès que le relais se ferme, le chauffe-eau mange 2,2 kW et l'injection tombe à zéro — un asservissement naïf se couperait aussitôt. La loi de commande **réinjecte la consommation du chauffe-eau dans le surplus** tant qu'il tourne pour cette raison, et les deux fronts sont temporisés (`surplusStartDelay` / `surplusStopDelay`) pour encaisser les passages nuageux.
+
+## Modes
+
+Pastille cliquable sur la ligne de la recette : **Auto** → **Boost** (chauffe jusqu'à coupure du thermostat, puis retour en auto) → **En pause** (aucun ordre envoyé).
+
+## Dégradations gracieuses
+
+| Configuration | Comportement |
+| --- | --- |
+| Pas de sonde (`tempKey` vide) | Plancher désactivé, HC + solaire fonctionnent |
+| Pas de mesure de puissance (`powerKey` vide) | Pas de détection de coupure : les cycles sont bornés par la plage et `maxCycle` |
+| Donnée périmée (`stale`) | Traitée comme absente — une vieille valeur ne déclenche rien |
+| Chauffe-eau allumé à la main | La recette se retire et n'envoie plus d'ordre jusqu'à extinction |
+| Redémarrage de l'instance | Le cycle en cours reprend avec son heure de départ d'origine, le relais n'est pas interrompu |
+
+## Développement
+
+```bash
+npm install
+npm test
+npm run build
+```
+
+Release : pousser un tag `vX.Y.Z` — le workflow GitHub construit et publie `sowel-recipe-water-heater-smart-X.Y.Z.tar.gz`. La version doit être identique dans `manifest.json`, le tag et le nom de l'archive.
+
+## Licence
+
+AGPL-3.0

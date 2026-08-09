@@ -5,8 +5,8 @@
   "version": "0.1.0",
   "description": "Drives an on/off water heater: hot-water floor, off-peak night cycle placed just before the window ends, and opportunistic solar-surplus heating. Detects the tank thermostat cut-off from the power draw.",
   "icon": "Droplets",
-  "repo": "computingify/sowel-recipe-water-heater-smart",
-  "author": "computingify",
+  "repo": "adn-dev-adrien/sowel-recipe-water-heater-smart",
+  "author": "adn-dev-adrien",
   "tags": ["automation", "energy", "water_heater"],
   "i18n": {
     "fr": {

@@ -34,9 +34,18 @@ L'asymétrie est voulue : conclure « plein » à tort laisse la maison sans eau
 
 L'instance connaît déjà tes heures creuses : elles sont saisies une fois sous **Réglages → Administration → Tarif d'énergie** et pilotent la facturation énergie. Les redemander dans la recette dupliquerait une configuration qui dérive ensuite en silence — tu changes la page tarifs, la recette continue sur les anciennes heures, sans rien pour le signaler.
 
-Le slot `hcSource` vaut `auto` par défaut : la recette lit `ctx.helpers.getTariff()` (Sowel ≥ 1.36, spec 138) et se replie sur les heures saisies dans la recette dès que ce n'est pas exploitable — core plus ancien, aucun tarif configuré, ou un jour que le calendrier ne couvre pas. Le repli est journalisé, et la source en vigueur est visible dans l'état de l'instance (`hcSource`).
+Le slot `hcSource` tranche, et **on ne remplit jamais les deux** :
 
-La plage est résolue à chaque évaluation, pas mise en cache au démarrage : modifier la page tarifs prend effet sans toucher à l'instance. Si le tarif déclare plusieurs plages creuses (nuit + midi), la recette prend **la plus longue** — celle qui a la place pour une chauffe complète — et le signale dans le journal.
+| `hcSource` | Champs horaires | Source |
+| --- | --- | --- |
+| `auto` (défaut) | masqués | `ctx.helpers.getTariff()` — Sowel ≥ 1.36, spec 138 |
+| `manual` | affichés, obligatoires | les heures saisies dans la recette |
+
+En mode `auto`, s'il n'y a pas de tarif exploitable, la recette **ne se replie pas** sur les champs masqués : ce serait piloter le chauffe-eau depuis des valeurs que tu ne vois pas dans le formulaire, exactement la dérive qu'on cherche à éviter. La chauffe en heures creuses est désactivée et journalisée ; le plancher et le solaire continuent de fonctionner.
+
+Et le problème est signalé **à la création de l'instance**, pas à 3 h du matin : `validate()` refuse le mode `auto` si le core n'expose pas le tarif ou si aucun tarif n'est configuré, en nommant les deux façons de corriger.
+
+La plage est résolue à chaque évaluation, jamais mise en cache au démarrage : modifier la page tarifs prend effet sans toucher à l'instance. Si le tarif déclare plusieurs plages creuses (nuit + midi), la recette prend **la plus longue** — celle qui a la place pour une chauffe complète — et le signale.
 
 ## Le cycle nocturne apprend sa durée
 

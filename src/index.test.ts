@@ -195,6 +195,7 @@ const BASE_PARAMS: Record<string, unknown> = {
   heaterPower: 2200,
   minTemp: 20,
   rescueTemp: 25,
+  hcSource: "manual",
   hcStart: "22:00",
   hcEnd: "06:00",
   hcMode: "late",
@@ -208,6 +209,9 @@ const BASE_PARAMS: Record<string, unknown> = {
   cutoffDelay: "5m",
   maxCycle: "5h",
 };
+
+/** Same instance, but taking its off-peak hours from the instance tariff. */
+const AUTO_PARAMS: Record<string, unknown> = { ...BASE_PARAMS, hcSource: "auto" };
 
 /** Advance both the fake clock and the recipe's 30 s reconciliation ticker. */
 async function advance(minutes: number): Promise<void> {
@@ -419,6 +423,51 @@ describe("validate", () => {
     ).toThrow(/no data binding/);
   });
 
+  it("refuses automatic hours on a core that cannot serve them", () => {
+    const { ctx } = buildHarness(); // no getTariff
+    expect(() =>
+      createRecipe().validate({ ...BASE_PARAMS, hcSource: "auto" }, ctx as never),
+    ).toThrow(/does not expose the energy tariff/);
+  });
+
+  it("refuses automatic hours when no tariff is configured, naming both fixes", () => {
+    const { ctx } = buildHarness({
+      tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
+    });
+    expect(() =>
+      createRecipe().validate({ ...BASE_PARAMS, hcSource: "auto" }, ctx as never),
+    ).toThrow(/Energy tariff.*Times set here/s);
+  });
+
+  it("accepts automatic hours once a tariff exists", () => {
+    const { ctx } = buildHarness({
+      tariff: {
+        configured: true,
+        offPeakToday: [{ start: "22:00", end: "06:00", tariff: "hc" }],
+        isOffPeakNow: false,
+      },
+    });
+    expect(() =>
+      createRecipe().validate({ ...BASE_PARAMS, hcSource: "auto" }, ctx as never),
+    ).not.toThrow();
+  });
+
+  it("does not demand the time fields in automatic mode", () => {
+    const { ctx } = buildHarness({
+      tariff: {
+        configured: true,
+        offPeakToday: [{ start: "22:00", end: "06:00", tariff: "hc" }],
+        isOffPeakNow: false,
+      },
+    });
+    const { hcStart, hcEnd, ...noTimes } = BASE_PARAMS;
+    void hcStart;
+    void hcEnd;
+    expect(() =>
+      createRecipe().validate({ ...noTimes, hcSource: "auto" }, ctx as never),
+    ).not.toThrow();
+  });
+
   it("rejects a solar mode with no meter behind it", () => {
     const { ctx } = buildHarness();
     expect(() =>
@@ -618,7 +667,7 @@ describe("createInstance", () => {
     // and `late` placement, the tariff wins: 04:00→07:00, not 03:00→06:00.
     at("2026-08-09T22:30:00");
     const h = buildHarness({ tariff: NIGHT_TARIFF });
-    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.state.get("hcWindow")).toBe("04:00 → 07:00");
@@ -631,7 +680,7 @@ describe("createInstance", () => {
     // tariff's 23:00→07:00 heat window.
     at("2026-08-10T06:30:00");
     const h = buildHarness({ tariff: NIGHT_TARIFF });
-    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.lastOrder()).toMatchObject({ value: true });
@@ -639,53 +688,77 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  it("falls back to the slots on a core with no tariff helper", async () => {
+  it("disables off-peak heating on a core with no tariff helper", async () => {
+    // Nothing to fall back to: in automatic mode the recipe's own time fields
+    // are hidden, so using them would drive the heater from invisible values.
     at("2026-08-09T22:30:00");
     const h = buildHarness(); // no getTariff at all — Sowel < 1.36
-    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
-    await advance(1);
+    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    await advance(10);
 
-    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
-    expect(h.state.get("hcSource")).toBe("manual");
-    expect(h.logLines.some((l) => l.includes("n'expose pas les heures creuses"))).toBe(true);
+    expect(h.state.get("hcWindow")).toBeNull();
+    expect(h.state.get("hcSource")).toBeNull();
+    expect(h.orderCalls).toHaveLength(0);
+    expect(h.logLines.some((l) => l.includes("n'expose pas le tarif"))).toBe(true);
     handle.stop();
   });
 
-  it("falls back to the slots when no tariff is configured", async () => {
+  it("disables off-peak heating when no tariff is configured, and says how to fix it", async () => {
     at("2026-08-09T22:30:00");
     const h = buildHarness({
       tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
     });
-    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
-    await advance(1);
+    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    await advance(10);
 
-    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
-    expect(h.state.get("hcSource")).toBe("manual");
-    expect(h.logLines.some((l) => l.includes("Aucun tarif configuré"))).toBe(true);
+    expect(h.state.get("hcWindow")).toBeNull();
+    expect(h.orderCalls).toHaveLength(0);
+    const msg = h.logLines.find((l) => l.includes("Aucun tarif configuré"));
+    expect(msg).toContain("Tarif d'énergie");
+    expect(msg).toContain("Heures saisies ici");
     handle.stop();
   });
 
-  it("falls back to the slots on a day the schedule does not cover", async () => {
+  it("keeps the floor working while off-peak heating is disabled", async () => {
+    // Losing the tariff must not leave the house without hot water.
+    at("2026-08-09T22:30:00");
+    const h = buildHarness({
+      tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 15 },
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("floor");
+    handle.stop();
+  });
+
+  it("skips the night on a day the schedule does not cover", async () => {
     at("2026-08-09T22:30:00");
     const h = buildHarness({
       tariff: { configured: true, offPeakToday: [], isOffPeakNow: false },
     });
-    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
-    await advance(1);
+    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    await advance(10);
 
-    expect(h.state.get("hcSource")).toBe("manual");
+    expect(h.state.get("hcWindow")).toBeNull();
+    expect(h.orderCalls).toHaveLength(0);
     expect(h.logLines.some((l) => l.includes("aucune heure creuse aujourd'hui"))).toBe(true);
     handle.stop();
   });
 
-  it("survives a core whose tariff read throws", async () => {
+  it("disables off-peak heating when the tariff read throws", async () => {
     at("2026-08-09T22:30:00");
     const h = buildHarness({ tariffThrows: true });
-    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
     await advance(2);
 
-    expect(h.state.get("hcSource")).toBe("manual");
-    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
+    expect(h.state.get("hcWindow")).toBeNull();
     expect(h.logLines.some((l) => l.includes("Lecture du tarif Sowel impossible"))).toBe(true);
     handle.stop();
   });
@@ -693,10 +766,7 @@ describe("createInstance", () => {
   it("ignores the tariff when the user pins the hours manually", async () => {
     at("2026-08-09T22:30:00");
     const h = buildHarness({ tariff: NIGHT_TARIFF });
-    const handle = createRecipe().createInstance(
-      { ...BASE_PARAMS, hcSource: "manual" },
-      h.ctx as never,
-    );
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
@@ -716,7 +786,7 @@ describe("createInstance", () => {
         isOffPeakNow: false,
       },
     });
-    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.state.get("hcWindow")).toBe("04:00 → 07:00");

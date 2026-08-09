@@ -499,7 +499,7 @@ function buildSlots(): RecipeSlotDef[] {
       id: "hcSource",
       name: "Off-peak hours source",
       description:
-        "Read the hours from the instance's energy tariff (Settings → Administration), or use the times below. Automatic falls back to the times below when no tariff is configured.",
+        "Read the hours from the instance's energy tariff (Settings → Administration) instead of entering them twice, or set them here. With the tariff selected and none configured, off-peak heating is disabled and logged — the floor and solar reasons keep working.",
       type: "select",
       required: false,
       defaultValue: "auto",
@@ -512,10 +512,11 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "hcStart",
       name: "Off-peak start",
-      description: "Beginning of the cheap-tariff window. Used as the fallback in automatic mode.",
+      description: "Beginning of the cheap-tariff window",
       type: "time",
-      required: true,
+      required: false,
       defaultValue: "22:00",
+      hiddenWhen: { slot: "hcSource", equals: "auto" },
       group: "hc",
     },
     {
@@ -523,8 +524,9 @@ function buildSlots(): RecipeSlotDef[] {
       name: "Off-peak end",
       description: "End of the cheap-tariff window",
       type: "time",
-      required: true,
+      required: false,
       defaultValue: "06:00",
+      hiddenWhen: { slot: "hcSource", equals: "auto" },
       group: "hc",
     },
     {
@@ -708,16 +710,13 @@ const FR: RecipeLangPack = {
     hcSource: {
       name: "Source des heures creuses",
       description:
-        "Lire les heures depuis le tarif d'énergie de l'instance (Réglages → Administration), ou utiliser les heures ci-dessous. Le mode automatique bascule sur les heures ci-dessous si aucun tarif n'est configuré.",
+        "Lire les heures depuis le tarif d'énergie de l'instance (Réglages → Administration) plutôt que de les saisir deux fois, ou les définir ici. Avec le tarif sélectionné et aucun tarif configuré, la chauffe en heures creuses est désactivée et journalisée — le plancher et le solaire continuent de fonctionner.",
       options: {
         auto: "Tarif d'énergie Sowel (recommandé)",
         manual: "Heures saisies ici",
       },
     },
-    hcStart: {
-      name: "Début heures creuses",
-      description: "Début de la plage tarifaire basse. Sert de repli en mode automatique.",
-    },
+    hcStart: { name: "Début heures creuses", description: "Début de la plage tarifaire basse" },
     hcEnd: { name: "Fin heures creuses", description: "Fin de la plage tarifaire basse" },
     hcMode: {
       name: "Placement du cycle",
@@ -838,11 +837,38 @@ export function createRecipe(): RecipeDefinition {
         throw new Error(`"${heater.name}" has no on/off order binding (expected alias "state")`);
       }
 
-      if (!isValidHHMM(params.hcStart) || !isValidHHMM(params.hcEnd)) {
-        throw new Error("Off-peak start and end must be valid HH:MM times");
-      }
-      if (params.hcStart === params.hcEnd) {
-        throw new Error("Off-peak start and end must differ");
+      // The times belong to manual mode only. In automatic mode the hours come
+      // from the instance tariff and the fields are hidden, so demanding them
+      // would be asking for a value that is then ignored.
+      if (String(params.hcSource ?? "auto") === "manual") {
+        if (!isValidHHMM(params.hcStart) || !isValidHHMM(params.hcEnd)) {
+          throw new Error("Off-peak start and end must be valid HH:MM times");
+        }
+        if (params.hcStart === params.hcEnd) {
+          throw new Error("Off-peak start and end must differ");
+        }
+      } else {
+        // Fail here rather than at 3 a.m. Automatic mode with an unreadable
+        // tariff starts cleanly and then simply never heats at night — the user
+        // would only find out from the journal. Refusing at configuration time
+        // puts the message where the decision is made.
+        const read = ctx.helpers?.getTariff;
+        if (typeof read !== "function") {
+          throw new Error(
+            'This Sowel version does not expose the energy tariff to recipes. Set "Off-peak hours source" to "Times set here".',
+          );
+        }
+        let configured = false;
+        try {
+          configured = read().configured;
+        } catch {
+          configured = false;
+        }
+        if (!configured) {
+          throw new Error(
+            'No energy tariff is configured. Fill Settings → Administration → Energy tariff, or set "Off-peak hours source" to "Times set here".',
+          );
+        }
       }
 
       const minTemp = toNumber(params.minTemp) ?? 20;
@@ -1108,49 +1134,54 @@ export function createRecipe(): RecipeDefinition {
        * every evaluation rather than cached at start, so an edit to the tariff
        * page takes effect without touching the instance.
        */
-      function resolveHcWindow(): {
-        startMin: number;
-        endMin: number;
-        source: "tariff" | "manual";
-      } {
-        const manual = {
-          startMin: manualStartMin,
-          endMin: manualEndMin,
-          source: "manual" as const,
-        };
-        if (hcSource === "manual") return manual;
+      type HcWindow = { startMin: number; endMin: number; source: "tariff" | "manual" };
+
+      /**
+       * The off-peak window in force, or `null` when there is none.
+       *
+       * In `auto` the hours come from the instance tariff and the recipe's own
+       * time fields are hidden — so there is nothing to fall back *to*. Falling
+       * back to them anyway would resurrect the duplicated configuration this
+       * mode exists to remove, and worse, drive the heater from values the user
+       * cannot see in the form. `null` instead disables off-peak heating and
+       * says so; the floor and solar reasons keep working.
+       */
+      function resolveHcWindow(): HcWindow | null {
+        if (hcSource === "manual") {
+          return { startMin: manualStartMin, endMin: manualEndMin, source: "manual" };
+        }
 
         const read = ctx.helpers.getTariff;
         if (typeof read !== "function") {
           warnOnce(
-            "no-tariff-helper",
-            "Cette version de Sowel n'expose pas les heures creuses aux recettes — utilisation des heures saisies dans la recette",
+            "no-tariff",
+            "Cette version de Sowel n'expose pas le tarif aux recettes — chauffe en heures creuses désactivée. Passe « Source des heures creuses » sur « Heures saisies ici ».",
           );
-          return manual;
+          return null;
         }
 
         try {
           const tariff = read();
           if (!tariff.configured) {
             warnOnce(
-              "tariff-unconfigured",
-              "Aucun tarif configuré dans Sowel (Réglages → Administration → Tarif d'énergie) — utilisation des heures saisies dans la recette",
+              "no-tariff",
+              "Aucun tarif configuré dans Sowel — chauffe en heures creuses désactivée. Renseigne Réglages → Administration → Tarif d'énergie, ou passe « Source des heures creuses » sur « Heures saisies ici ».",
             );
-            return manual;
+            return null;
           }
           const picked = pickMainOffPeakSlot(tariff.offPeakToday);
           if (!picked) {
             warnOnce(
-              "tariff-no-slot-today",
-              "Le tarif Sowel ne déclare aucune heure creuse aujourd'hui — utilisation des heures saisies dans la recette",
+              "no-slot-today",
+              "Le tarif Sowel ne déclare aucune heure creuse aujourd'hui — pas de chauffe nocturne pour cette journée",
             );
-            return manual;
+            return null;
           }
-          warned.delete("tariff-unconfigured");
-          warned.delete("tariff-no-slot-today");
+          warned.delete("no-tariff");
+          warned.delete("no-slot-today");
           if (tariff.offPeakToday.length > 1) {
             warnOnce(
-              "tariff-multi-slot",
+              "multi-slot",
               `${tariff.offPeakToday.length} plages d'heures creuses configurées — la recette utilise la plus longue (${minutesToHm(
                 picked.startMin,
               )}→${minutesToHm(picked.endMin)})`,
@@ -1159,32 +1190,33 @@ export function createRecipe(): RecipeDefinition {
           return { ...picked, source: "tariff" };
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          warnOnce("tariff-read-failed", `Lecture du tarif Sowel impossible (${msg}) — repli sur les heures de la recette`);
-          return manual;
+          warnOnce(
+            "tariff-read-failed",
+            `Lecture du tarif Sowel impossible (${msg}) — chauffe en heures creuses désactivée`,
+          );
+          return null;
         }
       }
 
-      /** Length of the off-peak window currently in force — the ceiling the
-       *  learned duration is clamped to. */
+      /** Ceiling the learned duration is clamped to. With no window there are
+       *  no off-peak cycles to learn from, so the bound is nominal. */
       function currentWindowMin(): number {
         const w = resolveHcWindow();
-        return windowLength(w.startMin, w.endMin);
+        return w ? windowLength(w.startMin, w.endMin) : 1440;
       }
 
       /** Logged once per change so the journal shows which hours are in force. */
       let lastWindowLabel: string | null = null;
-      function announceWindow(w: {
-        startMin: number;
-        endMin: number;
-        source: "tariff" | "manual";
-      }): void {
-        const label = `${minutesToHm(w.startMin)}→${minutesToHm(w.endMin)} (${
-          w.source === "tariff" ? "tarif Sowel" : "réglage recette"
-        })`;
+      function announceWindow(w: HcWindow | null): void {
+        const label = w
+          ? `${minutesToHm(w.startMin)}→${minutesToHm(w.endMin)} (${
+              w.source === "tariff" ? "tarif Sowel" : "réglage recette"
+            })`
+          : "aucune";
         if (label === lastWindowLabel) return;
         if (lastWindowLabel !== null) ctx.log(`Heures creuses : ${label}`);
         lastWindowLabel = label;
-        ctx.state.set("hcSource", w.source);
+        ctx.state.set("hcSource", w ? w.source : null);
       }
 
       // ── Off-peak placement ────────────────────────────────
@@ -1197,10 +1229,11 @@ export function createRecipe(): RecipeDefinition {
         return now - lastFullCycleAt > fullCycleEveryDays * 24 * 60 * 60 * 1000;
       }
 
-      function hcHeatWindow(now: number): { startMin: number; endMin: number } {
-        const effective = needsFullCycle(now) ? "full" : hcMode;
+      function hcHeatWindow(now: number): { startMin: number; endMin: number } | null {
         const w = resolveHcWindow();
         announceWindow(w);
+        if (!w) return null;
+        const effective = needsFullCycle(now) ? "full" : hcMode;
         return computeHcHeatWindow(w.startMin, w.endMin, effective, hcEstimateMin);
       }
 
@@ -1273,8 +1306,8 @@ export function createRecipe(): RecipeDefinition {
           temp,
           power,
           surplus,
-          inHc: isWithinWindow(nMin, hcWindow.startMin, hcWindow.endMin),
-          inHcHeat: isWithinWindow(nMin, heat.startMin, heat.endMin),
+          inHc: hcWindow !== null && isWithinWindow(nMin, hcWindow.startMin, hcWindow.endMin),
+          inHcHeat: heat !== null && isWithinWindow(nMin, heat.startMin, heat.endMin),
         };
       }
 
@@ -1548,7 +1581,10 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("power", s.power);
         ctx.state.set("surplus", s.surplus);
         ctx.state.set("tankFull", tankFull);
-        ctx.state.set("hcWindow", `${minutesToHm(heat.startMin)} → ${minutesToHm(heat.endMin)}`);
+        ctx.state.set(
+          "hcWindow",
+          heat ? `${minutesToHm(heat.startMin)} → ${minutesToHm(heat.endMin)}` : null,
+        );
         ctx.state.set("hcEstimateMin", hcEstimateMin);
         ctx.state.set("relayOn", relayOn);
         ctx.state.set("onSince", onSince ? new Date(onSince).toISOString() : null);
@@ -1630,9 +1666,13 @@ export function createRecipe(): RecipeDefinition {
         solarMode === "off" ? "sans solaire" : `solaire ${solarMode} via ${nameOf(solarSourceId)}`,
       ].join(", ");
       ctx.log(
-        `Recette démarrée sur ${heaterName} — HC ${minutesToHm(startupWindow.startMin)}→${minutesToHm(
-          startupWindow.endMin,
-        )} (${startupWindow.source === "tariff" ? "tarif Sowel" : "réglage recette"}, ${hcMode}), plancher ${minTemp}→${rescueTemp} °C, ${capabilities}`,
+        `Recette démarrée sur ${heaterName} — HC ${
+          startupWindow
+            ? `${minutesToHm(startupWindow.startMin)}→${minutesToHm(startupWindow.endMin)} (${
+                startupWindow.source === "tariff" ? "tarif Sowel" : "réglage recette"
+              }, ${hcMode})`
+            : "indisponible"
+        }, plancher ${minTemp}→${rescueTemp} °C, ${capabilities}`,
       );
       if (!tempKey) {
         warnOnce(

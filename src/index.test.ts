@@ -474,7 +474,7 @@ describe("createInstance", () => {
 
   it("stops when the off-peak window closes and grows the estimate", async () => {
     at("2026-08-10T05:50:00");
-    const h = buildHarness();
+    const h = buildHarness({ initialState: { powerProven: true } });
     const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
     expect(h.lastOrder()).toMatchObject({ value: true });
@@ -482,6 +482,21 @@ describe("createInstance", () => {
     await advance(15); // crosses 06:00 — window closed, still drawing power
     expect(h.lastOrder()).toMatchObject({ value: false });
     expect(h.state.get("hcEstimateMin")).toBe(225); // 180 + 45
+    handle.stop();
+  });
+
+  it("leaves the estimate alone when the power channel is unproven", async () => {
+    // The window closed without a cut-off, but with an unproven channel that
+    // says nothing: growing here would creep towards heating all night.
+    at("2026-08-10T05:50:00");
+    const h = buildHarness({ drawWhenOn: 0 });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    await advance(15); // past 06:00
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    expect(h.state.get("hcEstimateMin")).toBe(180); // untouched
     handle.stop();
   });
 

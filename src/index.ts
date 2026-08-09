@@ -1185,7 +1185,19 @@ export function createRecipe(): RecipeDefinition {
           // reaching the cut-off only tells us the estimate was too short —
           // grow it, never shrink it. A stop for any other cause (pause, manual,
           // tank full) says nothing about the duration and must not teach.
-          if (previous === "hc" && !tankFull && !s.inHcHeat && cycleStartedAt !== null && powerKey) {
+          // `powerProven` is required: without a channel that has demonstrably
+          // seen the heater, "the window closed before the cut-off" is not a
+          // fact — the cut-off may simply be invisible. Growing on that would
+          // walk the estimate up to the whole window night after night and
+          // heat until 6 am for nothing.
+          if (
+            previous === "hc" &&
+            !tankFull &&
+            !s.inHcHeat &&
+            cycleStartedAt !== null &&
+            powerKey &&
+            powerProven
+          ) {
             hcEstimateMin = learnEstimate(hcEstimateMin, 0, false, hcWindowMin);
             ctx.log(
               `Fin de plage sans coupure du thermostat — estimation portée à ${hcEstimateMin} min`,

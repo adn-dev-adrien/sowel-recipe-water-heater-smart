@@ -667,6 +667,30 @@ describe("createInstance", () => {
     handle.stop();
   });
 
+  it("stops forcing a full window every night when there is no metering", async () => {
+    // Without metering the cut-off is unobservable, so the periodic full cycle
+    // would be permanently "due" and the late placement would never apply.
+    at("2026-08-10T05:50:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 45 },
+      ],
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, fullCycleEveryDays: 7 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("hcWindow")).toBe("22:00 → 06:00"); // first night: forced full
+    expect(h.state.get("relayOn")).toBe(true);
+
+    await advance(15); // window closes at 06:00
+    expect(h.state.get("lastFullCycleAt")).not.toBeNull();
+    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00"); // late placement resumes
+    handle.stop();
+  });
+
   it("uses the whole window when a periodic full cycle is due", async () => {
     at("2026-08-09T22:05:00");
     const h = buildHarness();
@@ -1030,6 +1054,39 @@ describe("createInstance", () => {
     h.setBinding(METER, "power", -3000); // 3000 < 2200 + 2000 — not enough
     await advance(10);
     expect(h.orderCalls).toHaveLength(0);
+    handle.stop();
+  });
+
+  it("publishes the thresholds it is actually comparing against", async () => {
+    // "Why didn't it start?" must be answerable from the instance state alone.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartMargin: 1800, maxGridImport: 200 },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -1989); // exactly the reported situation
+    await advance(10);
+
+    expect(h.state.get("surplus")).toBe(1989);
+    expect(h.state.get("solarStartAt")).toBe(4000);
+    expect(h.state.get("solarStopAt")).toBe(2000);
+    expect(h.orderCalls).toHaveLength(0);
+    handle.stop();
+  });
+
+  it("starts on a modest surplus once the margin is sized sensibly", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartMargin: 300 },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -2600); // 2600 >= 2200 + 300
+    await advance(4);
+    expect(h.lastOrder()).toMatchObject({ value: true });
     handle.stop();
   });
 

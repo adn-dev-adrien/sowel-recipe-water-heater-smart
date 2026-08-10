@@ -68,8 +68,10 @@ Les deux seuils sont **asymétriques, et ce n'est pas un réglage** :
 
 | Seuil | Rôle | Défaut |
 | --- | --- | --- |
-| `surplusStartMargin` | Réserve exigée au-dessus de la puissance du chauffe-eau avant de démarrer. Démarrer est un pari : on n'engage 2,2 kW que sur un surplus franc. | 2000 W |
+| `surplusStartMargin` | **S'ajoute à** la puissance du chauffe-eau : 2200 W + 300 W ⇒ démarrage à 2500 W de surplus. Le chauffe-eau ne peut pas tourner sur moins que sa propre puissance, donc ce réglage n'est que la réserve par-dessus. | 300 W |
 | `maxGridImport` | Soutirage réseau toléré une fois lancé. S'arrêter est un constat comptable. | 200 W |
+
+L'état de l'instance publie `surplus`, `solarStartAt` et `solarStopAt` côte à côte : les seuils sont calculés, pas saisis, et sans eux à l'écran la seule façon de répondre à « pourquoi ça n'a pas démarré ? » est de refaire l'addition à la main.
 
 Comme le surplus contient déjà la consommation du chauffe-eau, `puissance − surplus` **est** exactement le nombre de watts pris sur le réseau à cet instant. Le seuil d'arrêt signifie donc littéralement « arrête-toi dès que le réseau fournit plus que ça ».
 

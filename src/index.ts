@@ -594,12 +594,12 @@ function buildSlots(): RecipeSlotDef[] {
     },
     {
       id: "surplusStartMargin",
-      name: "Start margin (W)",
+      name: "Start margin above heater power (W)",
       description:
-        "Headroom required above the heater's own power before starting on solar. Raise it to only fire on a comfortably established surplus rather than a fleeting one.",
+        "ADDED TO the heater power to get the start threshold: 2200 W heater + 300 W margin means solar heating starts at 2500 W of surplus. The heater cannot run on less than its own power, so this is only the safety headroom on top — a few hundred watts is usually right, the confirmation delay already filters out brief peaks.",
       type: "number",
       required: false,
-      defaultValue: 2000,
+      defaultValue: 300,
       constraints: { min: 0, max: 6000 },
       hiddenWhen: { slot: "solarMode", equals: "off" },
       group: "solar",
@@ -753,9 +753,9 @@ const FR: RecipeLangPack = {
         "Production photovoltaïque. Obligatoire en mode production seule ; en mode compteur général, c'est un garde-fou optionnel — on ne peut jamais injecter plus qu'on ne produit.",
     },
     surplusStartMargin: {
-      name: "Marge de démarrage (W)",
+      name: "Marge de démarrage au-dessus de la puissance (W)",
       description:
-        "Réserve exigée au-dessus de la puissance du chauffe-eau avant de démarrer sur le solaire. À augmenter pour ne partir que sur un surplus bien installé, pas sur une éclaircie.",
+        "S'AJOUTE à la puissance du chauffe-eau pour donner le seuil de démarrage : 2200 W de chauffe-eau + 300 W de marge = démarrage à 2500 W de surplus. Le chauffe-eau ne peut pas tourner sur moins que sa propre puissance, donc ceci n'est que la réserve de sécurité par-dessus — quelques centaines de watts suffisent en général, le délai de confirmation filtre déjà les pics brefs.",
     },
     maxGridImport: {
       name: "Soutirage toléré (W)",
@@ -1411,6 +1411,15 @@ export function createRecipe(): RecipeDefinition {
           // fact — the cut-off may simply be invisible. Growing on that would
           // walk the estimate up to the whole window night after night and
           // heat until 6 am for nothing.
+          // Without a proven metering channel the thermostat cut-off can never
+          // be observed, so `lastFullCycleAt` would stay null forever and the
+          // periodic full cycle would be "due" every single night — pinning the
+          // window wide open and defeating the late placement. A cycle that ran
+          // the whole off-peak window is the best evidence available that the
+          // tank was filled; record it as such.
+          if (previous === "hc" && !s.inHcHeat && cycleStartedAt !== null && !powerProven) {
+            lastFullCycleAt = s.now;
+          }
           if (
             previous === "hc" &&
             !tankFull &&
@@ -1585,6 +1594,11 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("temp", s.temp);
         ctx.state.set("power", s.power);
         ctx.state.set("surplus", s.surplus);
+        // The thresholds are derived, not typed: without them on screen the
+        // only way to answer "why didn't it start?" is to redo the arithmetic
+        // by hand. `surplus` next to `solarStartAt` answers it at a glance.
+        ctx.state.set("solarStartAt", solarMode === "off" ? null : heaterPowerW + surplusStartMargin);
+        ctx.state.set("solarStopAt", solarMode === "off" ? null : heaterPowerW - maxGridImport);
         ctx.state.set("tankFull", tankFull);
         ctx.state.set(
           "hcWindow",

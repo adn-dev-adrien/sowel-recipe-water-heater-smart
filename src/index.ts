@@ -21,10 +21,12 @@
  *     and spends the fewest hours cooling down in the tank.
  *
  *  3. SOLAR SURPLUS (free energy, outside HC)
- *     When the house exports more than the heater draws, heat. The control law
- *     adds the heater's own draw back into the surplus while it is running,
- *     otherwise the export collapses to zero the second the relay closes and
- *     the recipe would immediately cut itself off (classic oscillation).
+ *     Two absolute thresholds read straight off the grid meter: heat once the
+ *     house exports more than `surplusStartPower`, stop once the grid supplies
+ *     more than `maxGridImport`. The control law adds the heater's own draw
+ *     back into the surplus while it is running, otherwise the export collapses
+ *     to zero the second the relay closes and the recipe would immediately cut
+ *     itself off (classic oscillation).
  *
  * ── How "the tank is full" is detected ────────────────────────────────────
  *
@@ -593,22 +595,22 @@ function buildSlots(): RecipeSlotDef[] {
       group: "solar",
     },
     {
-      id: "surplusStartMargin",
-      name: "Start margin above heater power (W)",
+      id: "surplusStartPower",
+      name: "Start above export (W)",
       description:
-        "ADDED TO the heater power to get the start threshold: 2200 W heater + 300 W margin means solar heating starts at 2500 W of surplus. The heater cannot run on less than its own power, so this is only the safety headroom on top — a few hundred watts is usually right, the confirmation delay already filters out brief peaks.",
+        "Start heating once this many watts are being exported to the grid. Read it literally: 2500 means the meter must show 2500 W going out. Setting it below the heater power is allowed — the shortfall is then drawn from the grid, so the tolerated grid draw must cover it.",
       type: "number",
       required: false,
-      defaultValue: 300,
-      constraints: { min: 0, max: 6000 },
+      defaultValue: 2500,
+      constraints: { min: 0, max: 10000 },
       hiddenWhen: { slot: "solarMode", equals: "off" },
       group: "solar",
     },
     {
       id: "maxGridImport",
-      name: "Tolerated grid draw (W)",
+      name: "Stop above grid draw (W)",
       description:
-        "Once running on solar, stop as soon as the grid supplies more than this. It is what keeps a solar cycle from quietly turning into a purchase.",
+        "Stop heating once the grid supplies more than this many watts. Read it literally, same as the start threshold but on the import side. It is what keeps a solar cycle from quietly turning into a purchase.",
       type: "number",
       required: false,
       defaultValue: 200,
@@ -752,15 +754,15 @@ const FR: RecipeLangPack = {
       description:
         "Production photovoltaïque. Obligatoire en mode production seule ; en mode compteur général, c'est un garde-fou optionnel — on ne peut jamais injecter plus qu'on ne produit.",
     },
-    surplusStartMargin: {
-      name: "Marge de démarrage au-dessus de la puissance (W)",
+    surplusStartPower: {
+      name: "Démarrage au-dessus de (W injectés)",
       description:
-        "S'AJOUTE à la puissance du chauffe-eau pour donner le seuil de démarrage : 2200 W de chauffe-eau + 300 W de marge = démarrage à 2500 W de surplus. Le chauffe-eau ne peut pas tourner sur moins que sa propre puissance, donc ceci n'est que la réserve de sécurité par-dessus — quelques centaines de watts suffisent en général, le délai de confirmation filtre déjà les pics brefs.",
+        "La chauffe démarre quand on injecte au moins cette puissance sur le réseau. À lire au pied de la lettre : 2500 signifie que le compteur doit afficher 2500 W qui partent. On peut descendre sous la puissance du chauffe-eau — le manque est alors tiré du réseau, donc le soutirage toléré doit le couvrir.",
     },
     maxGridImport: {
-      name: "Soutirage toléré (W)",
+      name: "Arrêt au-dessus de (W soutirés)",
       description:
-        "Une fois lancée sur le solaire, la chauffe s'arrête dès que le réseau fournit plus que ça. C'est la garantie de ne pas acheter de l'électricité en croyant consommer son soleil.",
+        "La chauffe s'arrête quand le réseau fournit plus que cette puissance. À lire au pied de la lettre aussi, mais côté soutirage. C'est la garantie de ne pas acheter de l'électricité en croyant consommer son soleil.",
     },
     surplusStartDelay: {
       name: "Délai de confirmation du surplus",
@@ -878,6 +880,26 @@ export function createRecipe(): RecipeDefinition {
       if (solarMode === "production_only" && !params.productionEquipment) {
         throw new Error("Production-only mode needs a production meter");
       }
+
+      // Both solar thresholds are absolute meter readings, so nothing stops a
+      // user from picking a pair that contradicts itself. Starting at S watts
+      // exported puts `heaterPower - S` watts on the grid the instant the relay
+      // closes; if the tolerated draw does not strictly exceed that, the stop
+      // condition is already true and the recipe would start and stop on every
+      // cycle. Catch it here rather than let it wear out a contactor.
+      if (solarMode !== "off") {
+        const heaterPowerW = toNumber(params.heaterPower) ?? 2200;
+        const startPower = toNumber(params.surplusStartPower) ?? 2500;
+        const gridImport = toNumber(params.maxGridImport) ?? 200;
+        const drawAtStart = heaterPowerW - startPower;
+        if (gridImport <= drawAtStart) {
+          throw new Error(
+            `Starting at ${startPower} W exported draws ${drawAtStart} W from the grid with a ${heaterPowerW} W heater, ` +
+              `which already meets the ${gridImport} W stop threshold — the heater would stop as soon as it starts. ` +
+              `Raise the tolerated grid draw above ${drawAtStart} W, or raise the start threshold.`,
+          );
+        }
+      }
     },
 
     createInstance(params, ctx): RecipeInstanceHandle {
@@ -917,7 +939,7 @@ export function createRecipe(): RecipeDefinition {
       const productionId = params.productionEquipment ? String(params.productionEquipment) : null;
       const gridSign =
         params.gridSign === "import_negative" ? "import_negative" : "import_positive";
-      const surplusStartMargin = toNumber(params.surplusStartMargin) ?? 2000;
+      const surplusStartPower = toNumber(params.surplusStartPower) ?? 2500;
       const maxGridImport = toNumber(params.maxGridImport) ?? 200;
       const surplusStartMs = ctx.helpers.parseDuration(params.surplusStartDelay ?? "3m");
       const surplusStopMs = ctx.helpers.parseDuration(params.surplusStopDelay ?? "5m");
@@ -1311,20 +1333,26 @@ export function createRecipe(): RecipeDefinition {
           surplusLowSince = null;
           return false;
         }
-        // Asymmetric on purpose, and the asymmetry is not a tuning knob.
+        // Both thresholds are expressed in meter watts, the way a user reads
+        // them off the grid meter — start above N watts exported, stop above M
+        // watts imported. Neither is a margin relative to the heater.
         //
-        // Starting is a bet: commit 2.2 kW only when the surplus clearly
-        // exceeds it. Stopping is an accounting fact: `surplus` already has the
-        // heater's own draw added back, so `heaterPowerW - surplus` *is* the
-        // watts currently coming off the grid. Stopping below
-        // `heaterPowerW - maxGridImport` therefore means exactly "stop once the
-        // grid is supplying more than tolerated".
+        // `surplus` is the export the meter WOULD show with the heater off: it
+        // already has the heater's own draw added back. So while the heater is
+        // off it is the raw export, and comparing it to `surplusStartPower`
+        // directly is exactly "we are exporting at least that much".
         //
-        // A single symmetric margin conflated the two: widening it to be picky
-        // about starting also pushed the stop threshold down, so the recipe
-        // would keep heating while importing that same amount — buying power at
-        // peak price under the name of solar surplus.
-        const startAt = heaterPowerW + surplusStartMargin;
+        // Stopping is the same statement mirrored: `heaterPowerW - surplus` is
+        // the watts currently coming off the grid, so stopping below
+        // `heaterPowerW - maxGridImport` means "the grid supplies more than
+        // tolerated". Keeping the two independent matters — a single symmetric
+        // margin would tie being picky about starting to tolerating imports,
+        // i.e. buying power at peak price under the name of solar surplus.
+        //
+        // The two are only coherent if `surplusStartPower + maxGridImport`
+        // exceeds `heaterPowerW`; otherwise starting instantly satisfies the
+        // stop condition. `validate()` rejects that at configuration time.
+        const startAt = surplusStartPower;
         const stopAt = heaterPowerW - maxGridImport;
 
         if (relayOn && reason === "solar") {
@@ -1597,7 +1625,7 @@ export function createRecipe(): RecipeDefinition {
         // The thresholds are derived, not typed: without them on screen the
         // only way to answer "why didn't it start?" is to redo the arithmetic
         // by hand. `surplus` next to `solarStartAt` answers it at a glance.
-        ctx.state.set("solarStartAt", solarMode === "off" ? null : heaterPowerW + surplusStartMargin);
+        ctx.state.set("solarStartAt", solarMode === "off" ? null : surplusStartPower);
         ctx.state.set("solarStopAt", solarMode === "off" ? null : heaterPowerW - maxGridImport);
         ctx.state.set("tankFull", tankFull);
         ctx.state.set(

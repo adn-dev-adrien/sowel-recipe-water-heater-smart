@@ -209,7 +209,7 @@ const BASE_PARAMS: Record<string, unknown> = {
   hcEstimate: "3h",
   fullCycleEveryDays: 0,
   solarMode: "off",
-  surplusStartMargin: 200,
+  surplusStartPower: 2400,
   maxGridImport: 200,
   surplusStartDelay: "3m",
   surplusStopDelay: "5m",
@@ -501,6 +501,53 @@ describe("validate", () => {
     expect(() =>
       createRecipe().validate({ ...BASE_PARAMS, solarMode: "grid_injection" }, ctx as never),
     ).toThrow(/grid meter/);
+  });
+
+  it("rejects thresholds that would stop the heater as soon as it starts", () => {
+    // 2200 W heater started at 2000 W exported draws 200 W from the grid, which
+    // already meets a 200 W stop threshold: the relay would chatter.
+    const { ctx } = buildHarness();
+    expect(() =>
+      createRecipe().validate(
+        {
+          ...BASE_PARAMS,
+          solarMode: "grid_injection",
+          gridEquipment: METER,
+          heaterPower: 2200,
+          surplusStartPower: 2000,
+          maxGridImport: 200,
+        },
+        ctx as never,
+      ),
+    ).toThrow(/stop as soon as it starts/);
+  });
+
+  it("accepts the same thresholds once the tolerated draw clears the shortfall", () => {
+    const { ctx } = buildHarness();
+    expect(() =>
+      createRecipe().validate(
+        {
+          ...BASE_PARAMS,
+          solarMode: "grid_injection",
+          gridEquipment: METER,
+          heaterPower: 2200,
+          surplusStartPower: 2000,
+          maxGridImport: 201,
+        },
+        ctx as never,
+      ),
+    ).not.toThrow();
+  });
+
+  it("does not police the thresholds when solar is disabled", () => {
+    // They are hidden in the form, so a stale pair must not block saving.
+    const { ctx } = buildHarness();
+    expect(() =>
+      createRecipe().validate(
+        { ...BASE_PARAMS, solarMode: "off", surplusStartPower: 0, maxGridImport: 0 },
+        ctx as never,
+      ),
+    ).not.toThrow();
   });
 });
 
@@ -1022,18 +1069,19 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  it("a picky start margin does not licence buying power to keep going", async () => {
-    // The regression a single symmetric margin caused: widening it to 2000 W
-    // to be selective about starting also dragged the stop threshold down to
-    // 200 W, so the recipe kept heating while importing ~2 kW at peak price.
+  it("a picky start threshold does not licence buying power to keep going", async () => {
+    // The regression a single symmetric margin caused: widening it to be
+    // selective about starting also dragged the stop threshold down, so the
+    // recipe kept heating while importing ~2 kW at peak price. The two
+    // thresholds are independent precisely so that cannot happen again.
     at("2026-08-09T13:00:00");
     const h = buildHarness();
     const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, surplusStartMargin: 2000 },
+      { ...SOLAR_PARAMS, surplusStartPower: 4200 },
       h.ctx as never,
     );
 
-    h.setBinding(METER, "power", -4500); // 4500 > 2200 + 2000, starts
+    h.setBinding(METER, "power", -4500); // exporting 4500 >= 4200, starts
     await advance(4);
     expect(h.state.get("relayOn")).toBe(true);
 
@@ -1043,17 +1091,59 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  it("holds out for a comfortable surplus when the start margin is wide", async () => {
+  it("holds out for a comfortable export when the start threshold is high", async () => {
     at("2026-08-09T13:00:00");
     const h = buildHarness();
     const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, surplusStartMargin: 2000 },
+      { ...SOLAR_PARAMS, surplusStartPower: 4200 },
       h.ctx as never,
     );
 
-    h.setBinding(METER, "power", -3000); // 3000 < 2200 + 2000 — not enough
+    h.setBinding(METER, "power", -3000); // exporting 3000 < 4200 — not enough
     await advance(10);
     expect(h.orderCalls).toHaveLength(0);
+    handle.stop();
+  });
+
+  it("reads the start threshold as raw exported watts, not a margin", async () => {
+    // The whole point of the parameter: 2500 means "the meter shows 2500 W
+    // going out", with no arithmetic against the heater power.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartPower: 2500 },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -2400); // 2400 < 2500 — just short
+    await advance(10);
+    expect(h.orderCalls).toHaveLength(0);
+
+    h.setBinding(METER, "power", -2500); // exactly on the threshold
+    await advance(4);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    handle.stop();
+  });
+
+  it("starts below the heater power when the tolerated grid draw covers it", async () => {
+    // 2200 W heater started at 2000 W exported puts 200 W on the grid, which a
+    // 400 W tolerance absorbs — so it starts AND keeps running.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartPower: 2000, maxGridImport: 400 },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -2000);
+    await advance(4);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+
+    // Export collapsed to the 200 W draw the heater itself created: surplus is
+    // back to 2000, above the 1800 stop threshold, so it must hold.
+    h.setBinding(METER, "power", 200);
+    await advance(10);
+    expect(h.lastOrder()).toMatchObject({ value: true });
     handle.stop();
   });
 
@@ -1062,7 +1152,7 @@ describe("createInstance", () => {
     at("2026-08-09T13:00:00");
     const h = buildHarness();
     const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartMargin: 1800, maxGridImport: 200 },
+      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartPower: 4000, maxGridImport: 200 },
       h.ctx as never,
     );
 
@@ -1076,15 +1166,15 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  it("starts on a modest surplus once the margin is sized sensibly", async () => {
+  it("starts on a modest export once the threshold is sized sensibly", async () => {
     at("2026-08-09T13:00:00");
     const h = buildHarness();
     const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartMargin: 300 },
+      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartPower: 2500 },
       h.ctx as never,
     );
 
-    h.setBinding(METER, "power", -2600); // 2600 >= 2200 + 300
+    h.setBinding(METER, "power", -2600); // exporting 2600 >= 2500
     await advance(4);
     expect(h.lastOrder()).toMatchObject({ value: true });
     handle.stop();

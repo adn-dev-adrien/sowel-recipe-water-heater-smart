@@ -64,18 +64,30 @@ C'est la protection contre le scénario coûteux : une pince mal orientée ou un
 
 Dès que le relais se ferme, le chauffe-eau mange 2,2 kW et l'injection tombe à zéro — un asservissement naïf se couperait aussitôt. La loi de commande **réinjecte la consommation du chauffe-eau dans le surplus** tant qu'il tourne pour cette raison, et les deux fronts sont temporisés (`surplusStartDelay` / `surplusStopDelay`) pour encaisser les passages nuageux.
 
-Les deux seuils sont **asymétriques, et ce n'est pas un réglage** :
+Les deux seuils se lisent **au pied de la lettre, en watts au compteur** — aucun calcul dans la tête, aucune référence à la puissance du chauffe-eau :
 
 | Seuil | Rôle | Défaut |
 | --- | --- | --- |
-| `surplusStartMargin` | **S'ajoute à** la puissance du chauffe-eau : 2200 W + 300 W ⇒ démarrage à 2500 W de surplus. Le chauffe-eau ne peut pas tourner sur moins que sa propre puissance, donc ce réglage n'est que la réserve par-dessus. | 300 W |
-| `maxGridImport` | Soutirage réseau toléré une fois lancé. S'arrêter est un constat comptable. | 200 W |
+| `surplusStartPower` | Démarrer dès qu'on **injecte** au moins tant de watts. `2500` ⇒ le compteur doit afficher 2500 W qui partent. | 2500 W |
+| `maxGridImport` | S'arrêter dès qu'on **soutire** plus que tant de watts. Le même énoncé, côté réseau. | 200 W |
 
-L'état de l'instance publie `surplus`, `solarStartAt` et `solarStopAt` côte à côte : les seuils sont calculés, pas saisis, et sans eux à l'écran la seule façon de répondre à « pourquoi ça n'a pas démarré ? » est de refaire l'addition à la main.
+L'état de l'instance publie `surplus`, `solarStartAt` et `solarStopAt` côte à côte, pour répondre d'un coup d'œil à « pourquoi ça n'a pas démarré ? ».
 
-Comme le surplus contient déjà la consommation du chauffe-eau, `puissance − surplus` **est** exactement le nombre de watts pris sur le réseau à cet instant. Le seuil d'arrêt signifie donc littéralement « arrête-toi dès que le réseau fournit plus que ça ».
+Comme le surplus contient déjà la consommation du chauffe-eau, `puissance − surplus` **est** exactement le nombre de watts pris sur le réseau à cet instant — c'est ce qui permet au seuil d'arrêt de signifier littéralement « arrête-toi dès que le réseau fournit plus que ça ».
 
-Une marge unique et symétrique confondait les deux : l'élargir pour être exigeant au démarrage abaissait d'autant le seuil d'arrêt, et la recette continuait de chauffer en soutirant ce même montant — de l'électricité achetée au prix fort, sous l'étiquette « surplus solaire ». Un test verrouille ce cas.
+Les deux seuils restent **indépendants, et ce n'est pas un oubli**. Une marge unique et symétrique confondait les deux : l'élargir pour être exigeant au démarrage abaissait d'autant le seuil d'arrêt, et la recette continuait de chauffer en soutirant ce même montant — de l'électricité achetée au prix fort, sous l'étiquette « surplus solaire ». Un test verrouille ce cas.
+
+### Démarrer sous la puissance du chauffe-eau
+
+C'est permis, et parfois souhaitable : démarrer un chauffe-eau de 2200 W à 2000 W d'injection tire 200 W du réseau, ce qui peut valoir mieux que d'attendre un surplus qui n'arrivera pas. Il faut alors que le soutirage toléré **couvre le manque**.
+
+`validate()` refuse la combinaison incohérente : si `puissance − seuil de démarrage` atteint déjà le seuil d'arrêt, la recette démarrerait et s'arrêterait dans la foulée, à chaque cycle, sur le contacteur. La règle est donc
+
+```
+surplusStartPower + maxGridImport > heaterPower
+```
+
+Avec 2200 W de chauffe-eau démarrant à 2000 W d'injection, il faut un soutirage toléré **strictement supérieur à 200 W**. L'erreur affichée donne le chiffre à corriger.
 
 ## Modes
 

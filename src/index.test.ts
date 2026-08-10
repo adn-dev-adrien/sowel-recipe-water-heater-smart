@@ -1542,3 +1542,62 @@ describe("createInstance", () => {
     expect(h.orderCalls).toHaveLength(ordersBefore);
   });
 });
+
+// ============================================================
+// Form shape — what the recipe promises the UI
+// ============================================================
+
+describe("form shape", () => {
+  /**
+   * The recipe form lays a group out as `n <= 3 ? n : 2` columns, so a cell is
+   * ~120 px wide in a group of three and ~180 px in one of two. A label or a
+   * help line longer than its cell wraps, pushing its field below its
+   * neighbours' — which is exactly how the off-peak row came out crooked.
+   */
+  const THREE_COLUMN_GROUPS = new Set(["floor", "hc", "solar", "advanced"]);
+
+  const fields = () =>
+    createRecipe()
+      .slots // the form drops the zone slot and renders list slots full width
+      .filter((s) => s.group && s.id !== "zone");
+
+  it("keeps every label on one line", () => {
+    const fr = createRecipe().i18n?.fr?.slots ?? {};
+    for (const slot of fields()) {
+      const budget = THREE_COLUMN_GROUPS.has(slot.group!) ? 14 : 20;
+      expect(slot.name.length, `${slot.id} EN "${slot.name}"`).toBeLessThanOrEqual(budget);
+      const name = fr[slot.id]?.name ?? "";
+      expect(name.length, `${slot.id} FR "${name}"`).toBeLessThanOrEqual(budget);
+    }
+  });
+
+  it("keeps every help line on one line", () => {
+    const fr = createRecipe().i18n?.fr?.slots ?? {};
+    for (const slot of fields()) {
+      const budget = slot.list ? 40 : THREE_COLUMN_GROUPS.has(slot.group!) ? 20 : 30;
+      expect(slot.description.length, `${slot.id} EN "${slot.description}"`).toBeLessThanOrEqual(
+        budget,
+      );
+      const desc = fr[slot.id]?.description ?? "";
+      expect(desc.length, `${slot.id} FR "${desc}"`).toBeLessThanOrEqual(budget);
+    }
+  });
+
+  it("fills every grid row — no group of five", () => {
+    const counts = new Map<string, number>();
+    for (const slot of fields()) {
+      if (slot.list) continue;
+      counts.set(slot.group!, (counts.get(slot.group!) ?? 0) + 1);
+    }
+    for (const [group, n] of counts) {
+      expect([1, 2, 3, 4, 6, 8], `${group} has ${n} fields`).toContain(n);
+    }
+  });
+
+  it("translates every slot into French", () => {
+    const fr = createRecipe().i18n?.fr?.slots ?? {};
+    for (const slot of createRecipe().slots) {
+      expect(fr[slot.id], `missing fr i18n for ${slot.id}`).toBeTruthy();
+    }
+  });
+});

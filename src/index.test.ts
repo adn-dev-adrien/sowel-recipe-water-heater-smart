@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   createRecipe,
+  resolveBindingAlias,
   computeHcHeatWindow,
   pickMainOffPeakSlot,
   computeSurplus,
@@ -152,7 +153,12 @@ function buildHarness(opts: HarnessOptions = {}) {
       if (deviceObeys && equipmentId === HEATER) {
         const on = value === true || String(value).toUpperCase() === "ON";
         setBinding(HEATER, "state", on ? "ON" : "OFF");
-        setBinding(HEATER, "power", on ? drawWhenOn : 0);
+        // Drive whatever metering channel the device actually has — a relay
+        // without one must not sprout a `power` binding just by switching.
+        const metering = (equipments[HEATER] as { dataBindings: Binding[] }).dataBindings.find(
+          (b) => b.category === "power",
+        );
+        if (metering) metering.value = on ? drawWhenOn : 0;
       }
       return { success: true };
     },
@@ -196,8 +202,6 @@ function parseDurationLike(value: unknown): number {
 const BASE_PARAMS: Record<string, unknown> = {
   zone: "zone-1",
   heater: HEATER,
-  tempKey: "water_temperature",
-  powerKey: "power",
   heaterPower: 2200,
   minTemp: 20,
   rescueTemp: 25,
@@ -333,6 +337,32 @@ describe("learnEstimate", () => {
   });
 });
 
+describe("resolveBindingAlias", () => {
+  const bindings = [
+    { alias: "state", category: "light_state" },
+    { alias: "water_temperature", category: "temperature" },
+    { alias: "active_power", category: "power" },
+  ];
+
+  it("honours an explicit override above everything", () => {
+    expect(resolveBindingAlias(bindings, "state", "water_temperature", "temperature")).toBe("state");
+  });
+
+  it("prefers the conventional alias", () => {
+    expect(resolveBindingAlias(bindings, "", "water_temperature", "temperature")).toBe(
+      "water_temperature",
+    );
+  });
+
+  it("falls back to the category, so a vendor alias still works", () => {
+    expect(resolveBindingAlias(bindings, "", "power", "power")).toBe("active_power");
+  });
+
+  it("returns null when the reading is simply absent", () => {
+    expect(resolveBindingAlias([{ alias: "state", category: "light_state" }], "", "power", "power")).toBeNull();
+  });
+});
+
 describe("computeSurplus", () => {
   it("is null when solar is disabled or the reading is missing", () => {
     expect(computeSurplus("off", 1000, "import_positive", 0)).toBeNull();
@@ -445,6 +475,25 @@ describe("validate", () => {
     expect(() =>
       createRecipe().validate({ ...BASE_PARAMS, tempKey: "nope" }, ctx as never),
     ).toThrow(/no data binding/);
+  });
+
+  it("accepts a heater with no metering channel yet", () => {
+    // The real case: the relay is in place, the power sensor is not fitted
+    // yet. That must not block creating the instance.
+    const { ctx } = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 60 },
+      ],
+    });
+    expect(() => createRecipe().validate(BASE_PARAMS, ctx as never)).not.toThrow();
+  });
+
+  it("still rejects an override the user typed wrong", () => {
+    const { ctx } = buildHarness();
+    expect(() => createRecipe().validate({ ...BASE_PARAMS, powerKey: "nope" }, ctx as never)).toThrow(
+      /no data binding with alias "nope"/,
+    );
   });
 
   it("rejects a solar mode with no meter behind it", () => {
@@ -1151,22 +1200,33 @@ describe("createInstance", () => {
 
   // ── 7. Degraded configurations ───────────────────────────
 
-  it("runs off-peak only when no probe is configured", async () => {
+  it("runs off-peak only when the heater carries no probe", async () => {
     at("2026-08-10T03:05:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance({ ...BASE_PARAMS, tempKey: "" }, h.ctx as never);
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.lastOrder()).toMatchObject({ value: true });
     expect(h.state.get("reason")).toBe("hc");
-    expect(h.logLines.some((l) => l.includes("plancher d'eau chaude est inactif"))).toBe(true);
+    expect(h.logLines.some((l) => l.includes("chauffe de secours est inactive"))).toBe(true);
     handle.stop();
   });
 
-  it("bounds the cycle by the window when no power is measured", async () => {
+  it("bounds the cycle by the window when the heater has no metering", async () => {
     at("2026-08-10T05:50:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance({ ...BASE_PARAMS, powerKey: "" }, h.ctx as never);
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 45 },
+      ],
+      drawWhenOn: 0,
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
     expect(h.lastOrder()).toMatchObject({ value: true });
 
@@ -1260,6 +1320,53 @@ describe("createInstance", () => {
     h.setBinding(HEATER, "power", 0);
     await advance(6);
     expect(h.state.get("tankFull")).toBe(true);
+    handle.stop();
+  });
+
+  it("picks up a metering channel bound after the instance was created", async () => {
+    // The relay is installed before the power sensor. When the sensor is
+    // added later, cut-off detection must start working on its own — no
+    // param edit, no restart.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 45 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("relayOn")).toBe(true);
+    expect(h.state.get("power")).toBeNull();
+
+    // Sensor fitted and bound: it reports the resistor pulling.
+    h.setBinding(HEATER, "power", 2200);
+    await advance(2);
+    expect(h.state.get("powerProven")).toBe(true);
+
+    h.setBinding(HEATER, "power", 0); // thermostat opens
+    await advance(6);
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    handle.stop();
+  });
+
+  it("finds a vendor-named metering channel by category", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 45 },
+        { alias: "active_power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    h.setBinding(HEATER, "active_power", 2200);
+    await advance(2);
+    expect(h.state.get("powerProven")).toBe(true);
+    expect(h.logLines.some((l) => l.includes('"active_power" validée'))).toBe(true);
     handle.stop();
   });
 

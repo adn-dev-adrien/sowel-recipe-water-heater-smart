@@ -352,6 +352,27 @@ export function pickMainOffPeakSlot(
   return best ? { startMin: best.startMin, endMin: best.endMin } : null;
 }
 
+/**
+ * Which binding carries a given reading on the heater.
+ *
+ * An explicit slot value always wins. Otherwise the conventional alias is
+ * tried, then any binding of the right category — a vendor that names its
+ * channel `active_power` or `temp` still works. Resolved on every read rather
+ * than pinned at start, so a metering channel bound after the instance was
+ * created is picked up without editing anything.
+ */
+export function resolveBindingAlias(
+  bindings: { alias: string; category?: string }[],
+  explicit: string,
+  preferredAlias: string,
+  category: string,
+): string | null {
+  if (explicit) return explicit;
+  const byName = bindings.find((b) => b.alias === preferredAlias);
+  if (byName) return byName.alias;
+  return bindings.find((b) => b.category === category)?.alias ?? null;
+}
+
 export function computeSurplus(
   mode: "off" | "grid_injection" | "production_only",
   reading: number | null,
@@ -436,21 +457,20 @@ function buildSlots(): RecipeSlotDef[] {
     },
     {
       id: "tempKey",
-      name: "Temperature reading",
-      description: "Bottom-of-tank probe binding. Leave empty to disable the hot-water floor.",
+      name: "Temperature reading (optional)",
+      description:
+        "Leave empty: the tank probe is found on its own. Only set this to override the automatic pick.",
       type: "data-key",
       required: false,
-      defaultValue: "water_temperature",
       group: "main",
     },
     {
       id: "powerKey",
-      name: "Power reading",
+      name: "Power reading (optional)",
       description:
-        "Heater power binding, used to detect the tank thermostat cut-off. Leave empty if the relay has no metering.",
+        "Leave empty: the metering channel is found on its own, including one added later. Only set this to override the automatic pick.",
       type: "data-key",
       required: false,
-      defaultValue: "power",
       group: "main",
     },
     {
@@ -661,14 +681,14 @@ const FR: RecipeLangPack = {
     zone: { name: "Zone", description: "Zone du chauffe-eau" },
     heater: { name: "Chauffe-eau", description: "Relais marche/arrêt qui pilote le chauffe-eau" },
     tempKey: {
-      name: "Mesure de température",
+      name: "Mesure de température (optionnel)",
       description:
-        "Binding de la sonde en bas du ballon. Laisser vide pour désactiver le plancher d'eau chaude.",
+        "Laisser vide : la sonde du ballon est trouvée toute seule. À ne renseigner que pour forcer un autre binding.",
     },
     powerKey: {
-      name: "Mesure de puissance",
+      name: "Mesure de puissance (optionnel)",
       description:
-        "Binding de puissance du chauffe-eau, utilisé pour détecter la coupure du thermostat. Laisser vide si le relais ne mesure pas.",
+        "Laisser vide : la mesure de consommation est trouvée toute seule, y compris si tu l'ajoutes plus tard. À ne renseigner que pour forcer un autre binding.",
     },
     heaterPower: {
       name: "Puissance du chauffe-eau (W)",
@@ -841,13 +861,14 @@ export function createRecipe(): RecipeDefinition {
         throw new Error("Recovery temperature must be above the minimum temperature");
       }
 
-      const tempKey = String(params.tempKey ?? "");
-      if (tempKey && !heater.dataBindings.some((b) => b.alias === tempKey)) {
-        throw new Error(`"${heater.name}" has no data binding with alias "${tempKey}"`);
-      }
-      const powerKey = String(params.powerKey ?? "");
-      if (powerKey && !heater.dataBindings.some((b) => b.alias === powerKey)) {
-        throw new Error(`"${heater.name}" has no data binding with alias "${powerKey}"`);
+      // Only an alias the user typed can be wrong. Left empty, the binding is
+      // discovered at runtime — and may legitimately not exist yet, so its
+      // absence must not block creating the instance.
+      for (const slot of ["tempKey", "powerKey"] as const) {
+        const alias = String(params[slot] ?? "");
+        if (alias && !heater.dataBindings.some((b) => b.alias === alias)) {
+          throw new Error(`"${heater.name}" has no data binding with alias "${alias}"`);
+        }
       }
 
       const solarMode = String(params.solarMode ?? "off");
@@ -863,8 +884,19 @@ export function createRecipe(): RecipeDefinition {
       // ── Params ────────────────────────────────────────────
 
       const heaterId = String(params.heater);
-      const tempKey = String(params.tempKey ?? "").trim();
-      const powerKey = String(params.powerKey ?? "").trim();
+      const tempOverride = String(params.tempKey ?? "").trim();
+      const powerOverride = String(params.powerKey ?? "").trim();
+
+      function tempAlias(): string | null {
+        const eq = heaterEq();
+        return eq
+          ? resolveBindingAlias(eq.dataBindings, tempOverride, "water_temperature", "temperature")
+          : null;
+      }
+      function powerAlias(): string | null {
+        const eq = heaterEq();
+        return eq ? resolveBindingAlias(eq.dataBindings, powerOverride, "power", "power") : null;
+      }
       const heaterPowerW = toNumber(params.heaterPower) ?? 2200;
 
       const minTemp = toNumber(params.minTemp) ?? 20;
@@ -1208,18 +1240,20 @@ export function createRecipe(): RecipeDefinition {
       function snapshot(date: Date): Snapshot {
         const now = date.getTime();
         const eq = heaterEq();
-        const temp = tempKey ? readNumeric(eq, tempKey, tempMaxAgeMs) : null;
+        const tKey = tempAlias();
+        const temp = tKey ? readNumeric(eq, tKey, tempMaxAgeMs) : null;
         // Power keeps core's `stale` rule (2 min for the category): cut-off
         // detection is only meaningful on a live reading.
-        const power = powerKey ? readNumeric(eq, powerKey) : null;
+        const pKey = powerAlias();
+        const power = pKey ? readNumeric(eq, pKey) : null;
 
-        if (tempKey) {
+        if (tKey) {
           if (temp === null) {
             warnOnce(
               "temp-stale",
-              `Sonde "${tempKey}" muette depuis plus de ${ctx.helpers.formatDuration(
+              `Sonde "${tKey}" muette depuis plus de ${ctx.helpers.formatDuration(
                 tempMaxAgeMs,
-              )} — plancher d'eau chaude suspendu jusqu'à son retour`,
+              )} — chauffe de secours suspendue jusqu'à son retour`,
             );
           } else {
             warned.delete("temp-stale");
@@ -1382,7 +1416,7 @@ export function createRecipe(): RecipeDefinition {
             !tankFull &&
             !s.inHcHeat &&
             cycleStartedAt !== null &&
-            powerKey &&
+            powerAlias() !== null &&
             powerProven
           ) {
             hcEstimateMin = learnEstimate(hcEstimateMin, 0, false, currentWindowMin());
@@ -1393,10 +1427,10 @@ export function createRecipe(): RecipeDefinition {
           if (!(await sendRelay("off"))) return;
           // A whole cycle with the relay closed and no heating-level draw ever
           // seen is a wiring/binding problem, not a hot tank — say so.
-          if (powerKey && !powerProven && onSince !== null && s.now - onSince > STARTUP_GRACE_MS) {
+          if (powerAlias() && !powerProven && onSince !== null && s.now - onSince > STARTUP_GRACE_MS) {
             warnOnce(
               "peak-never-seen",
-              `La mesure "${powerKey}" n'a jamais dépassé ${Math.round(
+              `La mesure "${powerAlias()}" n'a jamais dépassé ${Math.round(
                 cyclePeakPower,
               )} W pendant la chauffe (attendu ≈ ${heaterPowerW} W) — détection de coupure inactive tant qu'elle n'a pas vu le chauffe-eau consommer`,
             );
@@ -1469,12 +1503,14 @@ export function createRecipe(): RecipeDefinition {
           cyclePeakPower = 0;
           return;
         }
-        if (!powerKey || s.power === null) return;
+        if (s.power === null) return;
         if (s.power > cyclePeakPower) cyclePeakPower = s.power;
         if (!powerProven && cyclePeakPower >= heaterPowerW * CUTOFF_MIN_PEAK_RATIO) {
           powerProven = true;
           ctx.state.set("powerProven", true);
-          ctx.log(`Mesure "${powerKey}" validée — ${Math.round(cyclePeakPower)} W observés en chauffe`);
+          ctx.log(
+            `Mesure "${powerAlias()}" validée — ${Math.round(cyclePeakPower)} W observés en chauffe`,
+          );
         }
         if (s.now - onSince < STARTUP_GRACE_MS) return;
         if (!powerProven) {
@@ -1609,7 +1645,9 @@ export function createRecipe(): RecipeDefinition {
 
       const unsubs: Array<() => void> = [];
       const watched = new Map<string, Set<string>>();
-      watched.set(heaterId, new Set([tempKey, powerKey, "state"].filter(Boolean)));
+      // The heater's own aliases are resolved per read, so accept any of its
+      // changes rather than pinning a set that a later binding would miss.
+      watched.set(heaterId, new Set<string>());
       if (solarSourceId) watched.set(solarSourceId, new Set(POWER_ALIASES));
 
       unsubs.push(
@@ -1630,8 +1668,10 @@ export function createRecipe(): RecipeDefinition {
       const startupWindow = resolveHcWindow();
       announceWindow(startupWindow);
       const capabilities = [
-        tempKey ? `sonde ${tempKey}` : "sans sonde (plancher désactivé)",
-        powerKey ? `puissance ${powerKey}` : "sans mesure de puissance (détection de coupure désactivée)",
+        tempAlias() ? `sonde ${tempAlias()}` : "sans sonde (chauffe de secours désactivée)",
+        powerAlias()
+          ? `puissance ${powerAlias()}`
+          : "sans mesure de puissance (détection de coupure désactivée)",
         solarMode === "off" ? "sans solaire" : `solaire ${solarMode} via ${nameOf(solarSourceId)}`,
       ].join(", ");
       ctx.log(
@@ -1641,13 +1681,13 @@ export function createRecipe(): RecipeDefinition {
             : "indisponible"
         }, plancher ${minTemp}→${rescueTemp} °C, ${capabilities}`,
       );
-      if (!tempKey) {
+      if (!tempAlias()) {
         warnOnce(
           "no-temp",
-          "Aucune sonde configurée : le plancher d'eau chaude est inactif, la recette ne fera que les heures creuses et le solaire",
+          "Aucune sonde de température trouvée sur le chauffe-eau : la chauffe de secours est inactive, la recette ne fera que les heures creuses et le solaire",
         );
       }
-      if (!powerKey) {
+      if (!powerAlias()) {
         warnOnce(
           "no-power",
           "Aucune mesure de puissance : impossible de détecter la coupure du thermostat, les cycles seront bornés par la plage horaire et la durée maximale",

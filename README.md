@@ -83,8 +83,10 @@ Pastille cliquable sur la ligne de la recette : **Auto** → **Boost** (chauffe 
 
 | Configuration | Comportement |
 | --- | --- |
-| Pas de sonde (`tempKey` vide) | Plancher désactivé, HC + solaire fonctionnent |
-| Pas de mesure de puissance (`powerKey` vide) | Pas de détection de coupure : les cycles sont bornés par la plage et `maxCycle` |
+| Bindings du chauffe-eau | Trouvés tout seuls : alias conventionnel (`water_temperature`, `power`), sinon n'importe quel binding de la bonne catégorie. Les slots ne servent qu'à forcer un autre choix. |
+| Capteur ajouté après coup | Résolu à chaque lecture : brancher la mesure de puissance plus tard active la détection de coupure sans rééditer ni redémarrer l'instance |
+| Pas de sonde de température | Chauffe de secours désactivée, HC + solaire fonctionnent |
+| Pas de mesure de puissance | Pas de détection de coupure : les cycles sont bornés par la plage et `maxCycle` |
 | Sonde qui remonte peu | Jugée sur son âge réel (`tempMaxAge`, 2 h par défaut), pas sur le flag `stale` de Sowel (15 min) : un ballon de plusieurs centaines de litres ne change pas de température entre deux remontées espacées |
 | Sonde muette au-delà de `tempMaxAge` | Plancher suspendu, avertissement dans le journal, reprise automatique au retour de la sonde |
 | Mesure de puissance périmée | Traitée comme absente — la détection de coupure exige une valeur vivante |

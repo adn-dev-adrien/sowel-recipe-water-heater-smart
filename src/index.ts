@@ -466,8 +466,9 @@ function buildSlots(): RecipeSlotDef[] {
 
     {
       id: "minTemp",
-      name: "Minimum temperature (°C)",
-      description: "Below this the heater runs immediately, whatever the tariff",
+      name: "Emergency heating starts below (°C)",
+      description:
+        "Tank has run cold: below this the heater runs immediately, whatever the tariff and whatever the sun.",
       type: "number",
       required: false,
       defaultValue: 20,
@@ -476,9 +477,9 @@ function buildSlots(): RecipeSlotDef[] {
     },
     {
       id: "tempMaxAge",
-      name: "Probe maximum age",
+      name: "Ignore the probe after (no news for)",
       description:
-        "Beyond this, the probe reading is ignored and the floor is suspended. A tank changes slowly, so a sparse probe is still usable.",
+        "A battery probe reports sparsely, and a full tank barely moves between two reports — so an old reading is still useful, up to a point. Past this delay it is treated as unknown rather than trusted, and emergency heating is suspended instead of firing on a stale value.",
       type: "duration",
       required: false,
       defaultValue: "2h",
@@ -486,8 +487,9 @@ function buildSlots(): RecipeSlotDef[] {
     },
     {
       id: "rescueTemp",
-      name: "Recovery temperature (°C)",
-      description: "A rescue heat-up stops here. Must be above the minimum.",
+      name: "Emergency heating stops at (°C)",
+      description:
+        "That same emergency heat-up stops here. The gap with the start temperature is what stops the relay chattering around a single threshold — it must be above it.",
       type: "number",
       required: false,
       defaultValue: 25,
@@ -495,40 +497,6 @@ function buildSlots(): RecipeSlotDef[] {
       group: "floor",
     },
 
-    {
-      id: "hcSource",
-      name: "Off-peak hours source",
-      description:
-        "Read the hours from the instance's energy tariff (Settings → Administration) instead of entering them twice, or set them here. With the tariff selected and none configured, off-peak heating is disabled and logged — the floor and solar reasons keep working.",
-      type: "select",
-      required: false,
-      defaultValue: "auto",
-      options: [
-        { value: "auto", label: "Sowel energy tariff (recommended)" },
-        { value: "manual", label: "Times set here" },
-      ],
-      group: "hc",
-    },
-    {
-      id: "hcStart",
-      name: "Off-peak start",
-      description: "Beginning of the cheap-tariff window",
-      type: "time",
-      required: false,
-      defaultValue: "22:00",
-      hiddenWhen: { slot: "hcSource", equals: "auto" },
-      group: "hc",
-    },
-    {
-      id: "hcEnd",
-      name: "Off-peak end",
-      description: "End of the cheap-tariff window",
-      type: "time",
-      required: false,
-      defaultValue: "06:00",
-      hiddenWhen: { slot: "hcSource", equals: "auto" },
-      group: "hc",
-    },
     {
       id: "hcMode",
       name: "Cycle placement",
@@ -605,14 +573,26 @@ function buildSlots(): RecipeSlotDef[] {
       group: "solar",
     },
     {
-      id: "surplusMargin",
-      name: "Surplus margin (W)",
+      id: "surplusStartMargin",
+      name: "Start margin (W)",
       description:
-        "Start above heater power + margin, stop below heater power − margin. Widen it to avoid chattering.",
+        "Headroom required above the heater's own power before starting on solar. Raise it to only fire on a comfortably established surplus rather than a fleeting one.",
+      type: "number",
+      required: false,
+      defaultValue: 2000,
+      constraints: { min: 0, max: 6000 },
+      hiddenWhen: { slot: "solarMode", equals: "off" },
+      group: "solar",
+    },
+    {
+      id: "maxGridImport",
+      name: "Tolerated grid draw (W)",
+      description:
+        "Once running on solar, stop as soon as the grid supplies more than this. It is what keeps a solar cycle from quietly turning into a purchase.",
       type: "number",
       required: false,
       defaultValue: 200,
-      constraints: { min: 0, max: 3000 },
+      constraints: { min: 0, max: 2000 },
       hiddenWhen: { slot: "solarMode", equals: "off" },
       group: "solar",
     },
@@ -695,29 +675,20 @@ const FR: RecipeLangPack = {
       description: "Puissance nominale de la résistance, sert à dimensionner le surplus solaire",
     },
     minTemp: {
-      name: "Température minimale (°C)",
-      description: "En dessous, le chauffe-eau démarre immédiatement, quel que soit le tarif",
+      name: "Chauffe de secours : démarrage sous (°C)",
+      description:
+        "Le ballon est vidé : en dessous, le chauffe-eau démarre immédiatement, quel que soit le tarif et quel que soit le soleil.",
     },
     tempMaxAge: {
-      name: "Âge maximal de la sonde",
+      name: "Ignorer la sonde après (sans nouvelle depuis)",
       description:
-        "Au-delà, la mesure est ignorée et le plancher est suspendu. Un ballon évolue lentement : une sonde qui remonte peu reste exploitable.",
+        "Une sonde sur pile remonte peu souvent, et un ballon plein bouge à peine entre deux remontées : une mesure un peu ancienne reste donc utile, jusqu'à un certain point. Passé ce délai elle est considérée comme inconnue plutôt que crue, et la chauffe de secours est suspendue au lieu de se déclencher sur une valeur périmée.",
     },
     rescueTemp: {
-      name: "Température de reprise (°C)",
-      description: "Une chauffe de secours s'arrête ici. Doit être supérieure au minimum.",
-    },
-    hcSource: {
-      name: "Source des heures creuses",
+      name: "Chauffe de secours : arrêt à (°C)",
       description:
-        "Lire les heures depuis le tarif d'énergie de l'instance (Réglages → Administration) plutôt que de les saisir deux fois, ou les définir ici. Avec le tarif sélectionné et aucun tarif configuré, la chauffe en heures creuses est désactivée et journalisée — le plancher et le solaire continuent de fonctionner.",
-      options: {
-        auto: "Tarif d'énergie Sowel (recommandé)",
-        manual: "Heures saisies ici",
-      },
+        "Cette même chauffe de secours s'arrête ici. L'écart avec la température de démarrage est ce qui évite que le relais batte autour d'un seuil unique — elle doit donc lui être supérieure.",
     },
-    hcStart: { name: "Début heures creuses", description: "Début de la plage tarifaire basse" },
-    hcEnd: { name: "Fin heures creuses", description: "Fin de la plage tarifaire basse" },
     hcMode: {
       name: "Placement du cycle",
       description:
@@ -761,10 +732,15 @@ const FR: RecipeLangPack = {
       description:
         "Production photovoltaïque. Obligatoire en mode production seule ; en mode compteur général, c'est un garde-fou optionnel — on ne peut jamais injecter plus qu'on ne produit.",
     },
-    surplusMargin: {
-      name: "Marge de surplus (W)",
+    surplusStartMargin: {
+      name: "Marge de démarrage (W)",
       description:
-        "Démarre au-dessus de puissance + marge, s'arrête en dessous de puissance − marge. À élargir si ça bat.",
+        "Réserve exigée au-dessus de la puissance du chauffe-eau avant de démarrer sur le solaire. À augmenter pour ne partir que sur un surplus bien installé, pas sur une éclaircie.",
+    },
+    maxGridImport: {
+      name: "Soutirage toléré (W)",
+      description:
+        "Une fois lancée sur le solaire, la chauffe s'arrête dès que le réseau fournit plus que ça. C'est la garantie de ne pas acheter de l'électricité en croyant consommer son soleil.",
     },
     surplusStartDelay: {
       name: "Délai de confirmation du surplus",
@@ -791,7 +767,7 @@ const FR: RecipeLangPack = {
   },
   groups: {
     main: "Équipement",
-    floor: "Plancher d'eau chaude",
+    floor: "Chauffe de secours (plus d'eau chaude)",
     hc: "Heures creuses",
     solar: "Surplus solaire",
     advanced: "Réglages avancés",
@@ -837,38 +813,26 @@ export function createRecipe(): RecipeDefinition {
         throw new Error(`"${heater.name}" has no on/off order binding (expected alias "state")`);
       }
 
-      // The times belong to manual mode only. In automatic mode the hours come
-      // from the instance tariff and the fields are hidden, so demanding them
-      // would be asking for a value that is then ignored.
-      if (String(params.hcSource ?? "auto") === "manual") {
-        if (!isValidHHMM(params.hcStart) || !isValidHHMM(params.hcEnd)) {
-          throw new Error("Off-peak start and end must be valid HH:MM times");
-        }
-        if (params.hcStart === params.hcEnd) {
-          throw new Error("Off-peak start and end must differ");
-        }
-      } else {
-        // Fail here rather than at 3 a.m. Automatic mode with an unreadable
-        // tariff starts cleanly and then simply never heats at night — the user
-        // would only find out from the journal. Refusing at configuration time
-        // puts the message where the decision is made.
-        const read = ctx.helpers?.getTariff;
-        if (typeof read !== "function") {
-          throw new Error(
-            'This Sowel version does not expose the energy tariff to recipes. Set "Off-peak hours source" to "Times set here".',
-          );
-        }
-        let configured = false;
-        try {
-          configured = read().configured;
-        } catch {
-          configured = false;
-        }
-        if (!configured) {
-          throw new Error(
-            'No energy tariff is configured. Fill Settings → Administration → Energy tariff, or set "Off-peak hours source" to "Times set here".',
-          );
-        }
+      // The off-peak hours are the instance's, full stop. They are configured
+      // once under Settings → Administration → Energy tariff; letting the
+      // recipe carry a second copy would mean two sources of truth that drift
+      // apart silently. Fail here rather than at 3 a.m.
+      const readTariff = ctx.helpers?.getTariff;
+      if (typeof readTariff !== "function") {
+        throw new Error(
+          "This Sowel version does not expose the energy tariff to recipes. Sowel 1.36 or later is required.",
+        );
+      }
+      let tariffConfigured = false;
+      try {
+        tariffConfigured = readTariff().configured;
+      } catch {
+        tariffConfigured = false;
+      }
+      if (!tariffConfigured) {
+        throw new Error(
+          "No energy tariff is configured. Fill Settings → Administration → Energy tariff and save it, then create this instance.",
+        );
       }
 
       const minTemp = toNumber(params.minTemp) ?? 20;
@@ -907,9 +871,6 @@ export function createRecipe(): RecipeDefinition {
       const rescueTemp = toNumber(params.rescueTemp) ?? 25;
       const tempMaxAgeMs = ctx.helpers.parseDuration(params.tempMaxAge ?? "2h") || 2 * 3600_000;
 
-      const manualStartMin = hmToMinutes(String(params.hcStart));
-      const manualEndMin = hmToMinutes(String(params.hcEnd));
-      const hcSource = params.hcSource === "manual" ? "manual" : "auto";
       const hcMode = (["late", "early", "full"] as const).includes(params.hcMode as never)
         ? (params.hcMode as "late" | "early" | "full")
         : "late";
@@ -924,7 +885,8 @@ export function createRecipe(): RecipeDefinition {
       const productionId = params.productionEquipment ? String(params.productionEquipment) : null;
       const gridSign =
         params.gridSign === "import_negative" ? "import_negative" : "import_positive";
-      const surplusMargin = toNumber(params.surplusMargin) ?? 200;
+      const surplusStartMargin = toNumber(params.surplusStartMargin) ?? 2000;
+      const maxGridImport = toNumber(params.maxGridImport) ?? 200;
       const surplusStartMs = ctx.helpers.parseDuration(params.surplusStartDelay ?? "3m");
       const surplusStopMs = ctx.helpers.parseDuration(params.surplusStopDelay ?? "5m");
 
@@ -1134,28 +1096,26 @@ export function createRecipe(): RecipeDefinition {
        * every evaluation rather than cached at start, so an edit to the tariff
        * page takes effect without touching the instance.
        */
-      type HcWindow = { startMin: number; endMin: number; source: "tariff" | "manual" };
+      type HcWindow = { startMin: number; endMin: number };
 
       /**
-       * The off-peak window in force, or `null` when there is none.
+       * Tonight's off-peak window, or `null` when the instance has none today.
        *
-       * In `auto` the hours come from the instance tariff and the recipe's own
-       * time fields are hidden — so there is nothing to fall back *to*. Falling
-       * back to them anyway would resurrect the duplicated configuration this
-       * mode exists to remove, and worse, drive the heater from values the user
-       * cannot see in the form. `null` instead disables off-peak heating and
-       * says so; the floor and solar reasons keep working.
+       * The hours are the instance's own, read from the energy tariff on every
+       * evaluation. The recipe deliberately keeps no copy of them: a second
+       * place to enter the same hours is a second place for them to be wrong,
+       * and the divergence would be invisible — the recipe would keep firing on
+       * stale hours long after the tariff page changed.
+       *
+       * `null` disables off-peak heating for the day and says so. The floor and
+       * solar reasons are unaffected, so the house still gets hot water.
        */
       function resolveHcWindow(): HcWindow | null {
-        if (hcSource === "manual") {
-          return { startMin: manualStartMin, endMin: manualEndMin, source: "manual" };
-        }
-
         const read = ctx.helpers.getTariff;
         if (typeof read !== "function") {
           warnOnce(
             "no-tariff",
-            "Cette version de Sowel n'expose pas le tarif aux recettes — chauffe en heures creuses désactivée. Passe « Source des heures creuses » sur « Heures saisies ici ».",
+            "Cette version de Sowel n'expose pas le tarif aux recettes (1.36 minimum) — chauffe en heures creuses désactivée",
           );
           return null;
         }
@@ -1165,7 +1125,7 @@ export function createRecipe(): RecipeDefinition {
           if (!tariff.configured) {
             warnOnce(
               "no-tariff",
-              "Aucun tarif configuré dans Sowel — chauffe en heures creuses désactivée. Renseigne Réglages → Administration → Tarif d'énergie, ou passe « Source des heures creuses » sur « Heures saisies ici ».",
+              "Aucun tarif configuré dans Sowel — chauffe en heures creuses désactivée. Renseigne Réglages → Administration → Tarif d'énergie et enregistre.",
             );
             return null;
           }
@@ -1187,7 +1147,7 @@ export function createRecipe(): RecipeDefinition {
               )}→${minutesToHm(picked.endMin)})`,
             );
           }
-          return { ...picked, source: "tariff" };
+          return picked;
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           warnOnce(
@@ -1208,15 +1168,11 @@ export function createRecipe(): RecipeDefinition {
       /** Logged once per change so the journal shows which hours are in force. */
       let lastWindowLabel: string | null = null;
       function announceWindow(w: HcWindow | null): void {
-        const label = w
-          ? `${minutesToHm(w.startMin)}→${minutesToHm(w.endMin)} (${
-              w.source === "tariff" ? "tarif Sowel" : "réglage recette"
-            })`
-          : "aucune";
+        const label = w ? `${minutesToHm(w.startMin)}→${minutesToHm(w.endMin)}` : "aucune";
         if (label === lastWindowLabel) return;
         if (lastWindowLabel !== null) ctx.log(`Heures creuses : ${label}`);
         lastWindowLabel = label;
-        ctx.state.set("hcSource", w ? w.source : null);
+        ctx.state.set("hcWindowToday", label);
       }
 
       // ── Off-peak placement ────────────────────────────────
@@ -1321,8 +1277,21 @@ export function createRecipe(): RecipeDefinition {
           surplusLowSince = null;
           return false;
         }
-        const startAt = heaterPowerW + surplusMargin;
-        const stopAt = Math.max(0, heaterPowerW - surplusMargin);
+        // Asymmetric on purpose, and the asymmetry is not a tuning knob.
+        //
+        // Starting is a bet: commit 2.2 kW only when the surplus clearly
+        // exceeds it. Stopping is an accounting fact: `surplus` already has the
+        // heater's own draw added back, so `heaterPowerW - surplus` *is* the
+        // watts currently coming off the grid. Stopping below
+        // `heaterPowerW - maxGridImport` therefore means exactly "stop once the
+        // grid is supplying more than tolerated".
+        //
+        // A single symmetric margin conflated the two: widening it to be picky
+        // about starting also pushed the stop threshold down, so the recipe
+        // would keep heating while importing that same amount — buying power at
+        // peak price under the name of solar surplus.
+        const startAt = heaterPowerW + surplusStartMargin;
+        const stopAt = heaterPowerW - maxGridImport;
 
         if (relayOn && reason === "solar") {
           if (s.surplus < stopAt) {
@@ -1668,9 +1637,7 @@ export function createRecipe(): RecipeDefinition {
       ctx.log(
         `Recette démarrée sur ${heaterName} — HC ${
           startupWindow
-            ? `${minutesToHm(startupWindow.startMin)}→${minutesToHm(startupWindow.endMin)} (${
-                startupWindow.source === "tariff" ? "tarif Sowel" : "réglage recette"
-              }, ${hcMode})`
+            ? `${minutesToHm(startupWindow.startMin)}→${minutesToHm(startupWindow.endMin)} (${hcMode})`
             : "indisponible"
         }, plancher ${minTemp}→${rescueTemp} °C, ${capabilities}`,
       );

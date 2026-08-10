@@ -30,22 +30,18 @@ L'asymétrie est voulue : conclure « plein » à tort laisse la maison sans eau
 
 **Conséquence pratique** : la mesure doit porter sur le chauffe-eau lui-même. Un compteur général ne convient pas — après la coupure du thermostat, la consommation résiduelle du logement reste au-dessus de `cutoffPower` et la coupure ne serait jamais vue.
 
-## Les heures creuses viennent de Sowel
+## Les heures creuses viennent de Sowel, et de nulle part ailleurs
 
-L'instance connaît déjà tes heures creuses : elles sont saisies une fois sous **Réglages → Administration → Tarif d'énergie** et pilotent la facturation énergie. Les redemander dans la recette dupliquerait une configuration qui dérive ensuite en silence — tu changes la page tarifs, la recette continue sur les anciennes heures, sans rien pour le signaler.
+La recette **ne propose aucun champ d'horaires**. Les heures creuses sont saisies une fois sous **Réglages → Administration → Tarif d'énergie**, et lues à chaque évaluation via `ctx.helpers.getTariff()` (Sowel ≥ 1.36, spec 138).
 
-Le slot `hcSource` tranche, et **on ne remplit jamais les deux** :
+C'est délibéré : un second endroit où saisir les mêmes heures est un second endroit où elles peuvent être fausses, et la divergence serait invisible — la recette continuerait de chauffer sur d'anciens horaires longtemps après la modification de la page tarifs.
 
-| `hcSource` | Champs horaires | Source |
-| --- | --- | --- |
-| `auto` (défaut) | masqués | `ctx.helpers.getTariff()` — Sowel ≥ 1.36, spec 138 |
-| `manual` | affichés, obligatoires | les heures saisies dans la recette |
+Conséquences :
 
-En mode `auto`, s'il n'y a pas de tarif exploitable, la recette **ne se replie pas** sur les champs masqués : ce serait piloter le chauffe-eau depuis des valeurs que tu ne vois pas dans le formulaire, exactement la dérive qu'on cherche à éviter. La chauffe en heures creuses est désactivée et journalisée ; le plancher et le solaire continuent de fonctionner.
-
-Et le problème est signalé **à la création de l'instance**, pas à 3 h du matin : `validate()` refuse le mode `auto` si le core n'expose pas le tarif ou si aucun tarif n'est configuré, en nommant les deux façons de corriger.
-
-La plage est résolue à chaque évaluation, jamais mise en cache au démarrage : modifier la page tarifs prend effet sans toucher à l'instance. Si le tarif déclare plusieurs plages creuses (nuit + midi), la recette prend **la plus longue** — celle qui a la place pour une chauffe complète — et le signale.
+- `validate()` refuse de créer l'instance si aucun tarif n'est configuré, en indiquant où le faire. Le problème se voit au moment du réglage, pas à 3 h du matin.
+- Modifier la page tarifs prend effet immédiatement, sans toucher à l'instance.
+- Si le tarif ne couvre pas la journée en cours, la chauffe nocturne est simplement sautée pour ce jour-là, et journalisée. La chauffe de secours et le solaire continuent.
+- Si plusieurs plages creuses sont déclarées (nuit + midi), la recette prend **la plus longue** — celle qui a la place pour une chauffe complète.
 
 ## Le cycle nocturne apprend sa durée
 
@@ -64,9 +60,20 @@ En mode compteur général, renseigner aussi le compteur de production active un
 
 C'est la protection contre le scénario coûteux : une pince mal orientée ou une convention de signe inversée fait lire « j'injecte 3 kW » alors qu'on soutire — et la recette allumerait 2,2 kW en heure pleine. Avec le plafond, production nulle signifie surplus nul, quoi que raconte le compteur.
 
-## Anti-oscillation solaire
+## Anti-oscillation solaire, et le piège du seuil unique
 
 Dès que le relais se ferme, le chauffe-eau mange 2,2 kW et l'injection tombe à zéro — un asservissement naïf se couperait aussitôt. La loi de commande **réinjecte la consommation du chauffe-eau dans le surplus** tant qu'il tourne pour cette raison, et les deux fronts sont temporisés (`surplusStartDelay` / `surplusStopDelay`) pour encaisser les passages nuageux.
+
+Les deux seuils sont **asymétriques, et ce n'est pas un réglage** :
+
+| Seuil | Rôle | Défaut |
+| --- | --- | --- |
+| `surplusStartMargin` | Réserve exigée au-dessus de la puissance du chauffe-eau avant de démarrer. Démarrer est un pari : on n'engage 2,2 kW que sur un surplus franc. | 2000 W |
+| `maxGridImport` | Soutirage réseau toléré une fois lancé. S'arrêter est un constat comptable. | 200 W |
+
+Comme le surplus contient déjà la consommation du chauffe-eau, `puissance − surplus` **est** exactement le nombre de watts pris sur le réseau à cet instant. Le seuil d'arrêt signifie donc littéralement « arrête-toi dès que le réseau fournit plus que ça ».
+
+Une marge unique et symétrique confondait les deux : l'élargir pour être exigeant au démarrage abaissait d'autant le seuil d'arrêt, et la recette continuait de chauffer en soutirant ce même montant — de l'électricité achetée au prix fort, sous l'étiquette « surplus solaire ». Un test verrouille ce cas.
 
 ## Modes
 

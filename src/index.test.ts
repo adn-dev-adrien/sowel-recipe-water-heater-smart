@@ -39,18 +39,24 @@ interface HarnessOptions {
   deviceObeys?: boolean;
   /** Pre-existing recipe state, as if restored from a previous instance. */
   initialState?: Record<string, unknown>;
-  /**
-   * Tariff snapshot the fake core hands back. `undefined` models a Sowel older
-   * than 1.36, where `ctx.helpers.getTariff` does not exist at all.
-   */
+  /** Tariff snapshot the fake core hands back. Defaults to 22:00-06:00. */
   tariff?: {
     configured: boolean;
     offPeakToday: { start: string; end: string; tariff: string }[];
     isOffPeakNow: boolean | null;
   };
+  /** Models a Sowel older than 1.36: `ctx.helpers.getTariff` does not exist. */
+  noTariffHelper?: boolean;
   /** Makes getTariff() throw, to prove a broken core cannot break the recipe. */
   tariffThrows?: boolean;
 }
+
+/** The instance's off-peak hours, as most tests assume them. */
+const DEFAULT_TARIFF = {
+  configured: true,
+  offPeakToday: [{ start: "22:00", end: "06:00", tariff: "hc" }],
+  isOffPeakNow: false,
+};
 
 function buildHarness(opts: HarnessOptions = {}) {
   const drawWhenOn = opts.drawWhenOn ?? 2200;
@@ -132,14 +138,14 @@ function buildHarness(opts: HarnessOptions = {}) {
     helpers: {
       parseDuration: (value: unknown) => parseDurationLike(value),
       formatDuration: (ms: number) => `${Math.round(ms / 60000)}min`,
-      ...(opts.tariff !== undefined || opts.tariffThrows
-        ? {
+      ...(opts.noTariffHelper
+        ? {}
+        : {
             getTariff: () => {
               if (opts.tariffThrows) throw new Error("classifier exploded");
-              return opts.tariff!;
+              return opts.tariff ?? DEFAULT_TARIFF;
             },
-          }
-        : {}),
+          }),
     },
     dispatchOrder: async (equipmentId: string, alias: string, value: unknown) => {
       orderCalls.push({ equipmentId, alias, value });
@@ -195,23 +201,18 @@ const BASE_PARAMS: Record<string, unknown> = {
   heaterPower: 2200,
   minTemp: 20,
   rescueTemp: 25,
-  hcSource: "manual",
-  hcStart: "22:00",
-  hcEnd: "06:00",
   hcMode: "late",
   hcEstimate: "3h",
   fullCycleEveryDays: 0,
   solarMode: "off",
-  surplusMargin: 200,
+  surplusStartMargin: 200,
+  maxGridImport: 200,
   surplusStartDelay: "3m",
   surplusStopDelay: "5m",
   cutoffPower: 300,
   cutoffDelay: "5m",
   maxCycle: "5h",
 };
-
-/** Same instance, but taking its off-peak hours from the instance tariff. */
-const AUTO_PARAMS: Record<string, unknown> = { ...BASE_PARAMS, hcSource: "auto" };
 
 /** Advance both the fake clock and the recipe's 30 s reconciliation ticker. */
 async function advance(minutes: number): Promise<void> {
@@ -409,11 +410,34 @@ describe("validate", () => {
     ).toThrow(/above the minimum/);
   });
 
-  it("rejects identical off-peak boundaries", () => {
+  it("refuses to run on a core that cannot serve the tariff", () => {
+    const { ctx } = buildHarness({ noTariffHelper: true });
+    expect(() => createRecipe().validate(BASE_PARAMS, ctx as never)).toThrow(
+      /1\.36 or later is required/,
+    );
+  });
+
+  it("refuses to run when no tariff is configured, and says where to fix it", () => {
+    const { ctx } = buildHarness({
+      tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
+    });
+    expect(() => createRecipe().validate(BASE_PARAMS, ctx as never)).toThrow(
+      /Settings → Administration → Energy tariff/,
+    );
+  });
+
+  it("accepts a configured tariff", () => {
     const { ctx } = buildHarness();
-    expect(() =>
-      createRecipe().validate({ ...BASE_PARAMS, hcStart: "22:00", hcEnd: "22:00" }, ctx as never),
-    ).toThrow(/must differ/);
+    expect(() => createRecipe().validate(BASE_PARAMS, ctx as never)).not.toThrow();
+  });
+
+  it("exposes no way to enter off-peak hours in the recipe", () => {
+    // The instance owns the hours. A second place to type them is a second
+    // place for them to be wrong, silently.
+    const ids = createRecipe().slots.map((slot) => slot.id);
+    expect(ids).not.toContain("hcStart");
+    expect(ids).not.toContain("hcEnd");
+    expect(ids).not.toContain("hcSource");
   });
 
   it("rejects a data key the heater does not expose", () => {
@@ -421,51 +445,6 @@ describe("validate", () => {
     expect(() =>
       createRecipe().validate({ ...BASE_PARAMS, tempKey: "nope" }, ctx as never),
     ).toThrow(/no data binding/);
-  });
-
-  it("refuses automatic hours on a core that cannot serve them", () => {
-    const { ctx } = buildHarness(); // no getTariff
-    expect(() =>
-      createRecipe().validate({ ...BASE_PARAMS, hcSource: "auto" }, ctx as never),
-    ).toThrow(/does not expose the energy tariff/);
-  });
-
-  it("refuses automatic hours when no tariff is configured, naming both fixes", () => {
-    const { ctx } = buildHarness({
-      tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
-    });
-    expect(() =>
-      createRecipe().validate({ ...BASE_PARAMS, hcSource: "auto" }, ctx as never),
-    ).toThrow(/Energy tariff.*Times set here/s);
-  });
-
-  it("accepts automatic hours once a tariff exists", () => {
-    const { ctx } = buildHarness({
-      tariff: {
-        configured: true,
-        offPeakToday: [{ start: "22:00", end: "06:00", tariff: "hc" }],
-        isOffPeakNow: false,
-      },
-    });
-    expect(() =>
-      createRecipe().validate({ ...BASE_PARAMS, hcSource: "auto" }, ctx as never),
-    ).not.toThrow();
-  });
-
-  it("does not demand the time fields in automatic mode", () => {
-    const { ctx } = buildHarness({
-      tariff: {
-        configured: true,
-        offPeakToday: [{ start: "22:00", end: "06:00", tariff: "hc" }],
-        isOffPeakNow: false,
-      },
-    });
-    const { hcStart, hcEnd, ...noTimes } = BASE_PARAMS;
-    void hcStart;
-    void hcEnd;
-    expect(() =>
-      createRecipe().validate({ ...noTimes, hcSource: "auto" }, ctx as never),
-    ).not.toThrow();
   });
 
   it("rejects a solar mode with no meter behind it", () => {
@@ -662,16 +641,16 @@ describe("createInstance", () => {
     isOffPeakNow: false,
   };
 
-  it("takes the off-peak hours from the instance tariff instead of the slots", async () => {
-    // Slots say 22:00→06:00, the tariff says 23:00→07:00. With a 3 h estimate
-    // and `late` placement, the tariff wins: 04:00→07:00, not 03:00→06:00.
+  it("follows the instance tariff when it changes", async () => {
+    // The instance says 23:00→07:00 tonight. With a 3 h estimate and `late`
+    // placement the cycle lands at 04:00→07:00 — no recipe-side copy involved.
     at("2026-08-09T22:30:00");
     const h = buildHarness({ tariff: NIGHT_TARIFF });
-    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.state.get("hcWindow")).toBe("04:00 → 07:00");
-    expect(h.state.get("hcSource")).toBe("tariff");
+    expect(h.state.get("hcWindowToday")).toBe("23:00→07:00");
     handle.stop();
   });
 
@@ -680,7 +659,7 @@ describe("createInstance", () => {
     // tariff's 23:00→07:00 heat window.
     at("2026-08-10T06:30:00");
     const h = buildHarness({ tariff: NIGHT_TARIFF });
-    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.lastOrder()).toMatchObject({ value: true });
@@ -692,12 +671,11 @@ describe("createInstance", () => {
     // Nothing to fall back to: in automatic mode the recipe's own time fields
     // are hidden, so using them would drive the heater from invisible values.
     at("2026-08-09T22:30:00");
-    const h = buildHarness(); // no getTariff at all — Sowel < 1.36
-    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    const h = buildHarness({ noTariffHelper: true }); // Sowel < 1.36
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(10);
 
     expect(h.state.get("hcWindow")).toBeNull();
-    expect(h.state.get("hcSource")).toBeNull();
     expect(h.orderCalls).toHaveLength(0);
     expect(h.logLines.some((l) => l.includes("n'expose pas le tarif"))).toBe(true);
     handle.stop();
@@ -708,14 +686,13 @@ describe("createInstance", () => {
     const h = buildHarness({
       tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
     });
-    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(10);
 
     expect(h.state.get("hcWindow")).toBeNull();
     expect(h.orderCalls).toHaveLength(0);
     const msg = h.logLines.find((l) => l.includes("Aucun tarif configuré"));
     expect(msg).toContain("Tarif d'énergie");
-    expect(msg).toContain("Heures saisies ici");
     handle.stop();
   });
 
@@ -730,7 +707,7 @@ describe("createInstance", () => {
         { alias: "power", category: "power", value: 0 },
       ],
     });
-    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.lastOrder()).toMatchObject({ value: true });
@@ -743,7 +720,7 @@ describe("createInstance", () => {
     const h = buildHarness({
       tariff: { configured: true, offPeakToday: [], isOffPeakNow: false },
     });
-    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(10);
 
     expect(h.state.get("hcWindow")).toBeNull();
@@ -755,22 +732,11 @@ describe("createInstance", () => {
   it("disables off-peak heating when the tariff read throws", async () => {
     at("2026-08-09T22:30:00");
     const h = buildHarness({ tariffThrows: true });
-    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(2);
 
     expect(h.state.get("hcWindow")).toBeNull();
     expect(h.logLines.some((l) => l.includes("Lecture du tarif Sowel impossible"))).toBe(true);
-    handle.stop();
-  });
-
-  it("ignores the tariff when the user pins the hours manually", async () => {
-    at("2026-08-09T22:30:00");
-    const h = buildHarness({ tariff: NIGHT_TARIFF });
-    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
-    await advance(1);
-
-    expect(h.state.get("hcWindow")).toBe("03:00 → 06:00");
-    expect(h.state.get("hcSource")).toBe("manual");
     handle.stop();
   });
 
@@ -786,7 +752,7 @@ describe("createInstance", () => {
         isOffPeakNow: false,
       },
     });
-    const handle = createRecipe().createInstance(AUTO_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(1);
 
     expect(h.state.get("hcWindow")).toBe("04:00 → 07:00");
@@ -948,6 +914,73 @@ describe("createInstance", () => {
 
     expect(h.lastOrder()).toMatchObject({ value: true });
     expect(h.state.get("reason")).toBe("solar");
+    handle.stop();
+  });
+
+  it("stops as soon as the grid supplies more than tolerated", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(SOLAR_PARAMS, h.ctx as never);
+
+    h.setBinding(METER, "power", -2500);
+    await advance(4);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    // Importing 500 W — above the 200 W tolerance, so this is a purchase, not
+    // a surplus. Effective surplus 2200-500 = 1700 < stop threshold 2000.
+    h.setBinding(METER, "power", 500);
+    await advance(6);
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    handle.stop();
+  });
+
+  it("keeps heating through a grid draw within tolerance", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(SOLAR_PARAMS, h.ctx as never);
+
+    h.setBinding(METER, "power", -2500);
+    await advance(4);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    h.setBinding(METER, "power", 100); // under the 200 W tolerance
+    await advance(10);
+    expect(h.state.get("relayOn")).toBe(true);
+    handle.stop();
+  });
+
+  it("a picky start margin does not licence buying power to keep going", async () => {
+    // The regression a single symmetric margin caused: widening it to 2000 W
+    // to be selective about starting also dragged the stop threshold down to
+    // 200 W, so the recipe kept heating while importing ~2 kW at peak price.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, surplusStartMargin: 2000 },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -4500); // 4500 > 2200 + 2000, starts
+    await advance(4);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    h.setBinding(METER, "power", 1800); // importing 1.8 kW
+    await advance(6);
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    handle.stop();
+  });
+
+  it("holds out for a comfortable surplus when the start margin is wide", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, surplusStartMargin: 2000 },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -3000); // 3000 < 2200 + 2000 — not enough
+    await advance(10);
+    expect(h.orderCalls).toHaveLength(0);
     handle.stop();
   });
 

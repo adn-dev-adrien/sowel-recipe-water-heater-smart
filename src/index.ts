@@ -460,8 +460,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "tempKey",
       name: "Temperature reading (optional)",
-      description:
-        "Leave empty: the tank probe is found on its own. Only set this to override the automatic pick.",
+      description: "Leave empty: the tank probe is found on its own",
       type: "data-key",
       required: false,
       group: "main",
@@ -469,8 +468,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "powerKey",
       name: "Power reading (optional)",
-      description:
-        "Leave empty: the metering channel is found on its own, including one added later. Only set this to override the automatic pick.",
+      description: "Leave empty: the metering channel is found on its own, even if added later",
       type: "data-key",
       required: false,
       group: "main",
@@ -489,8 +487,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "minTemp",
       name: "Emergency heating starts below (°C)",
-      description:
-        "Tank has run cold: below this the heater runs immediately, whatever the tariff and whatever the sun.",
+      description: "Below this the heater runs immediately, whatever the tariff",
       type: "number",
       required: false,
       defaultValue: 20,
@@ -500,8 +497,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "tempMaxAge",
       name: "Ignore the probe after (no news for)",
-      description:
-        "A battery probe reports sparsely, and a full tank barely moves between two reports — so an old reading is still useful, up to a point. Past this delay it is treated as unknown rather than trusted, and emergency heating is suspended instead of firing on a stale value.",
+      description: "Past this age the reading is ignored and emergency heating is suspended",
       type: "duration",
       required: false,
       defaultValue: "2h",
@@ -510,8 +506,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "rescueTemp",
       name: "Emergency heating stops at (°C)",
-      description:
-        "That same emergency heat-up stops here. The gap with the start temperature is what stops the relay chattering around a single threshold — it must be above it.",
+      description: "End of the emergency heat-up. Must be above the start temperature.",
       type: "number",
       required: false,
       defaultValue: 25,
@@ -522,8 +517,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "hcMode",
       name: "Cycle placement",
-      description:
-        "Where the night cycle sits inside the window. End of window keeps the water hottest at wake-up.",
+      description: "Where the night cycle sits inside the off-peak window",
       type: "select",
       required: false,
       defaultValue: "late",
@@ -533,8 +527,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "hcEstimate",
       name: "Initial full-heat duration",
-      description:
-        "Starting guess for a full heat-up. Refined after each cycle once the power channel is proven — until then it is used as-is, so err on the generous side: overshooting only means the tank thermostat regulates for a while, undershooting means lukewarm water.",
+      description: "Starting guess, refined after each cycle. When unsure, err high.",
       type: "duration",
       required: false,
       defaultValue: "4h",
@@ -543,8 +536,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "fullCycleEveryDays",
       name: "Force a full cycle every (days)",
-      description:
-        "Guarantees a periodic heat-up to the thermostat cut-off (anti-legionella). 0 disables it.",
+      description: "Periodic heat-up to the thermostat cut-off (anti-legionella). 0 disables.",
       type: "number",
       required: false,
       defaultValue: 7,
@@ -586,8 +578,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "productionEquipment",
       name: "Production meter",
-      description:
-        "Photovoltaic production. Required in production-only mode; in grid-meter mode it is an optional safety cap — export can never exceed production.",
+      description: "Required in production-only mode, optional safety cap otherwise",
       type: "equipment",
       required: false,
       constraints: { equipmentType: PRODUCTION_TYPES, crossZone: true },
@@ -597,8 +588,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "surplusStartPower",
       name: "Start above export (W)",
-      description:
-        "Start heating once this many watts are being exported to the grid. Read it literally: 2500 means the meter must show 2500 W going out. Setting it below the heater power is allowed — the shortfall is then drawn from the grid, so the tolerated grid draw must cover it.",
+      description: "Start once the meter exports at least this much",
       type: "number",
       required: false,
       defaultValue: 2500,
@@ -609,8 +599,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "maxGridImport",
       name: "Stop above grid draw (W)",
-      description:
-        "Stop heating once the grid supplies more than this many watts. Read it literally, same as the start threshold but on the import side. It is what keeps a solar cycle from quietly turning into a purchase.",
+      description: "Stop once the grid supplies more than this",
       type: "number",
       required: false,
       defaultValue: 200,
@@ -631,7 +620,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "surplusStopDelay",
       name: "Surplus loss delay",
-      description: "Surplus must stay lost this long before the heater stops (rides out clouds)",
+      description: "Surplus must stay lost this long before the heater stops",
       type: "duration",
       required: false,
       defaultValue: "5m",
@@ -642,7 +631,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "cutoffPower",
       name: "Cut-off threshold (W)",
-      description: "Power below this while the relay is closed means the tank thermostat opened",
+      description: "Below this with the relay closed, the tank thermostat has opened",
       type: "number",
       required: false,
       defaultValue: 300,
@@ -661,8 +650,7 @@ function buildSlots(): RecipeSlotDef[] {
     {
       id: "maxCycle",
       name: "Maximum continuous run",
-      description:
-        "Hard safety cap on a single uninterrupted heat-up. Keep it above the full-heat duration, or it will cut a legitimate off-peak cycle short.",
+      description: "Safety cap. Keep it above the full-heat duration.",
       type: "duration",
       required: false,
       defaultValue: "6h",
@@ -684,13 +672,11 @@ const FR: RecipeLangPack = {
     heater: { name: "Chauffe-eau", description: "Relais marche/arrêt qui pilote le chauffe-eau" },
     tempKey: {
       name: "Mesure de température (optionnel)",
-      description:
-        "Laisser vide : la sonde du ballon est trouvée toute seule. À ne renseigner que pour forcer un autre binding.",
+      description: "Laisser vide : la sonde est trouvée toute seule",
     },
     powerKey: {
       name: "Mesure de puissance (optionnel)",
-      description:
-        "Laisser vide : la mesure de consommation est trouvée toute seule, y compris si tu l'ajoutes plus tard. À ne renseigner que pour forcer un autre binding.",
+      description: "Laisser vide : la mesure est trouvée toute seule, même ajoutée plus tard",
     },
     heaterPower: {
       name: "Puissance du chauffe-eau (W)",
@@ -698,23 +684,19 @@ const FR: RecipeLangPack = {
     },
     minTemp: {
       name: "Chauffe de secours : démarrage sous (°C)",
-      description:
-        "Le ballon est vidé : en dessous, le chauffe-eau démarre immédiatement, quel que soit le tarif et quel que soit le soleil.",
+      description: "En dessous, la chauffe part tout de suite, quel que soit le tarif",
     },
     tempMaxAge: {
       name: "Ignorer la sonde après (sans nouvelle depuis)",
-      description:
-        "Une sonde sur pile remonte peu souvent, et un ballon plein bouge à peine entre deux remontées : une mesure un peu ancienne reste donc utile, jusqu'à un certain point. Passé ce délai elle est considérée comme inconnue plutôt que crue, et la chauffe de secours est suspendue au lieu de se déclencher sur une valeur périmée.",
+      description: "Passé ce délai, la mesure est ignorée et la chauffe de secours suspendue",
     },
     rescueTemp: {
       name: "Chauffe de secours : arrêt à (°C)",
-      description:
-        "Cette même chauffe de secours s'arrête ici. L'écart avec la température de démarrage est ce qui évite que le relais batte autour d'un seuil unique — elle doit donc lui être supérieure.",
+      description: "Fin de la chauffe de secours. Doit être au-dessus du seuil de démarrage.",
     },
     hcMode: {
       name: "Placement du cycle",
-      description:
-        "Position du cycle nocturne dans la plage. « Fin de plage » garde l'eau la plus chaude au réveil.",
+      description: "Position du cycle nocturne dans la plage",
       options: {
         late: "Fin de plage (recommandé)",
         early: "Début de plage",
@@ -723,13 +705,11 @@ const FR: RecipeLangPack = {
     },
     hcEstimate: {
       name: "Durée de chauffe initiale",
-      description:
-        "Estimation de départ d'une chauffe complète. Affinée à chaque cycle une fois la mesure de puissance validée ; d'ici là elle est utilisée telle quelle, donc voir large : surestimer fait seulement réguler le thermostat du ballon, sous-estimer donne de l'eau tiède.",
+      description: "Estimation de départ, affinée à chaque cycle. Dans le doute, voir large.",
     },
     fullCycleEveryDays: {
       name: "Cycle complet forcé tous les (jours)",
-      description:
-        "Garantit une chauffe périodique jusqu'à la coupure du thermostat (anti-légionelle). 0 désactive.",
+      description: "Chauffe périodique jusqu'à la coupure du thermostat. 0 désactive.",
     },
     solarMode: {
       name: "Surplus solaire",
@@ -751,18 +731,15 @@ const FR: RecipeLangPack = {
     },
     productionEquipment: {
       name: "Compteur de production",
-      description:
-        "Production photovoltaïque. Obligatoire en mode production seule ; en mode compteur général, c'est un garde-fou optionnel — on ne peut jamais injecter plus qu'on ne produit.",
+      description: "Obligatoire en production seule, garde-fou optionnel sinon",
     },
     surplusStartPower: {
       name: "Démarrage au-dessus de (W injectés)",
-      description:
-        "La chauffe démarre quand on injecte au moins cette puissance sur le réseau. À lire au pied de la lettre : 2500 signifie que le compteur doit afficher 2500 W qui partent. On peut descendre sous la puissance du chauffe-eau — le manque est alors tiré du réseau, donc le soutirage toléré doit le couvrir.",
+      description: "Démarre dès qu'on injecte au moins ça",
     },
     maxGridImport: {
       name: "Arrêt au-dessus de (W soutirés)",
-      description:
-        "La chauffe s'arrête quand le réseau fournit plus que cette puissance. À lire au pied de la lettre aussi, mais côté soutirage. C'est la garantie de ne pas acheter de l'électricité en croyant consommer son soleil.",
+      description: "Arrête dès qu'on soutire plus que ça",
     },
     surplusStartDelay: {
       name: "Délai de confirmation du surplus",
@@ -770,12 +747,11 @@ const FR: RecipeLangPack = {
     },
     surplusStopDelay: {
       name: "Délai de perte du surplus",
-      description: "Le surplus doit rester absent ce délai avant l'arrêt (encaisse les passages nuageux)",
+      description: "Le surplus doit rester absent ce délai avant l'arrêt",
     },
     cutoffPower: {
       name: "Seuil de coupure (W)",
-      description:
-        "Une puissance sous ce seuil alors que le relais est fermé signifie que le thermostat du ballon s'est ouvert",
+      description: "Sous ce seuil, relais fermé, le thermostat du ballon s'est ouvert",
     },
     cutoffDelay: {
       name: "Délai de confirmation de coupure",
@@ -783,8 +759,7 @@ const FR: RecipeLangPack = {
     },
     maxCycle: {
       name: "Durée de chauffe maximale",
-      description:
-        "Garde-fou sur une chauffe continue. À garder au-dessus de la durée de chauffe complète, sinon il coupera un cycle d'heures creuses légitime.",
+      description: "Garde-fou. À garder au-dessus de la durée de chauffe complète.",
     },
   },
   groups: {

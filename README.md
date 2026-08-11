@@ -45,7 +45,7 @@ L'asymétrie est voulue : conclure « plein » à tort laisse la maison sans eau
 
 ## Les heures creuses viennent de Sowel, et de nulle part ailleurs
 
-La recette **ne propose aucun champ d'horaires**. Les heures creuses sont saisies une fois sous **Réglages → Administration → Tarif d'énergie**, et lues à chaque évaluation via `ctx.helpers.getTariff()` (Sowel ≥ 1.36, spec 138).
+La recette **ne propose aucun champ d'horaires**. Les heures creuses sont saisies une fois dans la carte **« Tarifs énergie »** des Réglages, et lues à chaque évaluation via `ctx.helpers.getTariff()` (Sowel ≥ 1.36, spec 138).
 
 C'est délibéré : un second endroit où saisir les mêmes heures est un second endroit où elles peuvent être fausses, et la divergence serait invisible — la recette continuerait de chauffer sur d'anciens horaires longtemps après la modification de la page tarifs.
 
@@ -81,8 +81,10 @@ L'arbitre est l'unique lecteur du compteur. Il fait cette comptabilité une fois
 
 Rien dans le formulaire de la recette. Deux choses côté Sowel, une seule fois :
 
-1. **Équipements → le chauffe-eau → Gestion de l'énergie** : activer, classe `deferrable`, puissance nominale de la résistance.
-2. **Réglages → Administration → Énergie** : activer l'arbitrage, et placer le chauffe-eau dans la liste de priorité.
+1. **Fiche du chauffe-eau → panneau « Pilotage énergie »** : cocher « Charge pilotable », classe **Différable**, puissance nominale de la résistance. Cocher la case révèle le formulaire pré-rempli ; la première sauvegarde est un bouton explicite.
+2. **Réglages → carte « Arbitre de surplus »** : activer, et placer le chauffe-eau dans la liste de priorité — la charge du haut reçoit le surplus en premier, celle du bas s'éteint en premier.
+
+L'onglet qui héberge cette carte a bougé entre versions de Sowel (Administration jusqu'à la 1.39, onglet **Énergie** dédié ensuite), d'où des messages qui nomment la carte plutôt que le chemin.
 
 Si l'une des deux manque, le journal de l'instance le dit une fois, en nommant la page. Le reste de la recette continue : **heures creuses + plancher est un mode complet, pas un mode dégradé** — c'est aussi le mode de toutes les maisons sans photovoltaïque.
 

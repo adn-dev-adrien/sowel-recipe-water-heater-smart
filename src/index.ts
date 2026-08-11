@@ -808,7 +808,7 @@ export function createRecipe(): RecipeDefinition {
       }
 
       // The off-peak hours are the instance's, full stop. They are configured
-      // once under Settings → Administration → Energy tariff; letting the
+      // once in the "Energy tariffs" card under Settings; letting the
       // recipe carry a second copy would mean two sources of truth that drift
       // apart silently. Fail here rather than at 3 a.m.
       const readTariff = ctx.helpers?.getTariff;
@@ -825,7 +825,7 @@ export function createRecipe(): RecipeDefinition {
       }
       if (!tariffConfigured) {
         throw new Error(
-          "No energy tariff is configured. Fill Settings → Administration → Energy tariff and save it, then create this instance.",
+          "No energy tariff is configured. Fill the \"Energy tariffs\" card in Settings and save it, then create this instance.",
         );
       }
 
@@ -1141,7 +1141,7 @@ export function createRecipe(): RecipeDefinition {
        * Where the off-peak hours come from.
        *
        * The instance already knows them: they are configured once under
-       * Settings → Administration → Energy tariff and drive energy billing.
+       * the "Energy tariffs" card under Settings and drive energy billing.
        * Asking for them again in slots duplicates configuration that then
        * drifts — change the tariff page and the recipe keeps the old hours.
        *
@@ -1180,7 +1180,7 @@ export function createRecipe(): RecipeDefinition {
           if (!tariff.configured) {
             warnOnce(
               "no-tariff",
-              "Aucun tarif configuré dans Sowel — chauffe en heures creuses désactivée. Renseigne Réglages → Administration → Tarif d'énergie et enregistre.",
+              "Aucun tarif configuré dans Sowel — chauffe en heures creuses désactivée. Renseigne la carte « Tarifs énergie » dans les Réglages et enregistre.",
             );
             return null;
           }
@@ -1322,9 +1322,9 @@ export function createRecipe(): RecipeDefinition {
       /** Log-friendly wording for the reasons a claim can be turned down. */
       const DENY_FR: Record<CapacityDenyReason, string> = {
         "not-profiled":
-          "le chauffe-eau n'est pas déclaré comme charge pilotable — Équipements → le chauffe-eau → Gestion de l'énergie",
+          "le chauffe-eau n'est pas déclaré comme charge pilotable — ouvre sa fiche dans Équipements, panneau « Pilotage énergie », et coche « Charge pilotable »",
         "arbiter-disabled":
-          "l'arbitrage du surplus est désactivé — Réglages → Administration → Énergie",
+          "l'arbitrage du surplus est désactivé — Réglages, carte « Arbitre de surplus »",
         "equipment-already-claimed": "une autre recette a déjà réservé cet équipement",
         "override-active": "pilotage suspendu après une commande manuelle",
       };

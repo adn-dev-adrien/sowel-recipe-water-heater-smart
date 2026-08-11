@@ -502,7 +502,7 @@ describe("validate", () => {
       tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
     });
     expect(() => createRecipe().validate(BASE_PARAMS, ctx as never)).toThrow(
-      /Settings → Administration → Energy tariff/,
+      /"Energy tariffs" card in Settings/,
     );
   });
 
@@ -845,7 +845,7 @@ describe("createInstance", () => {
     expect(h.state.get("hcWindow")).toBeNull();
     expect(h.orderCalls).toHaveLength(0);
     const msg = h.logLines.find((l) => l.includes("Aucun tarif configuré"));
-    expect(msg).toContain("Tarif d'énergie");
+    expect(msg).toContain("Tarifs énergie");
     handle.stop();
   });
 
@@ -1248,7 +1248,10 @@ describe("createInstance", () => {
     // Off-peak still runs: tariff-only is a complete mode, not a degraded one.
     expect(h.lastOrder()).toMatchObject({ value: true });
     expect(h.state.get("reason")).toBe("hc");
-    expect(h.logLines.some((l) => l.includes("Gestion de l'énergie"))).toBe(true);
+    // Names the panel and the checkbox as the UI labels them ("Pilotage
+    // énergie" / "Charge pilotable"). A message that sends the user to a
+    // heading that does not exist is worse than no message.
+    expect(h.logLines.some((l) => l.includes("Charge pilotable"))).toBe(true);
     handle.stop();
   });
 

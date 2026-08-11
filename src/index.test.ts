@@ -914,6 +914,78 @@ describe("createInstance", () => {
     handle.stop();
   });
 
+  it("refuses to learn from a top-up cycle on an already-hot tank", async () => {
+    // Same shape as the cut-off test above, but the thermostat opens after ten
+    // minutes instead of ninety. Smoothing that in would drag a 3 h estimate
+    // to 2 h, and two sunny days would leave the off-peak placement too short
+    // to ever fill a drawn tank again.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+
+    await advance(9);
+    h.setBinding(HEATER, "power", 4); // thermostat opens after ~10 min
+    await advance(6);
+
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.state.get("hcEstimateMin")).toBe(180); // untouched
+    handle.stop();
+  });
+
+  it("remembers a probe-backed hot tank long enough to skip the night cycle", async () => {
+    // Filled by the sun at 15:00; the off-peak cycle would otherwise close the
+    // relay again at 03:00 on a tank that is still at temperature.
+    at("2026-08-10T03:10:00");
+    const h = buildHarness({
+      initialState: {
+        tankFull: true,
+        tankFullAt: new Date("2026-08-09T15:00:00").toISOString(), // 12 h 10 ago
+        tankFullTemp: 58,
+        hcEstimateMin: 180,
+      },
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 56 },
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankFullMemory: "14h" },
+      h.ctx as never,
+    );
+    await advance(2);
+
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.orderCalls).toHaveLength(0);
+    handle.stop();
+  });
+
+  it("keeps the blind two-hour ceiling when no probe can corroborate it", async () => {
+    at("2026-08-10T03:10:00");
+    const h = buildHarness({
+      initialState: {
+        tankFull: true,
+        tankFullAt: new Date("2026-08-09T15:00:00").toISOString(),
+        tankFullTemp: null,
+      },
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankFullMemory: "14h" },
+      h.ctx as never,
+    );
+    await advance(2);
+
+    expect(h.state.get("tankFull")).toBe(false);
+    expect(h.lastOrder()).toMatchObject({ value: true }); // off-peak cycle runs
+    handle.stop();
+  });
+
   it("releases the tank-full latch when the probe shows a real draw-off", async () => {
     at("2026-08-09T14:00:00");
     const h = buildHarness({
@@ -1180,14 +1252,51 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  it("never heats on solar during the off-peak window", async () => {
-    at("2026-08-09T23:00:00"); // inside HC, before the late cycle
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(SOLAR_PARAMS, h.ctx as never);
+  /**
+   * Solar used to be switched off across the whole off-peak window. That is
+   * invisible on a night window — nothing is exporting at 23:00 — and wrong on
+   * a daytime one: the Enedis afternoon HC slots sit in full production, and
+   * declining free watts there to wait for cheap ones inverts the point.
+   */
+  it("heats on solar inside the off-peak window, outside the placement cycle", async () => {
+    at("2026-08-09T12:30:00"); // inside a midday HC slot, before the late cycle
+    const h = buildHarness({
+      tariff: {
+        configured: true,
+        offPeakToday: [{ start: "11:00", end: "16:00", tariff: "hc" }],
+        isOffPeakNow: true,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, hcEstimate: "1h" }, // placement = 15:00 → 16:00
+      h.ctx as never,
+    );
 
     h.setBinding(METER, "power", -4000);
     await advance(10);
-    expect(h.orderCalls).toHaveLength(0);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("solar");
+    handle.stop();
+  });
+
+  it("lets the placement cycle own the relay when both reasons apply", async () => {
+    at("2026-08-09T15:30:00"); // inside the placement sub-window
+    const h = buildHarness({
+      tariff: {
+        configured: true,
+        offPeakToday: [{ start: "11:00", end: "16:00", tariff: "hc" }],
+        isOffPeakNow: true,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...SOLAR_PARAMS, hcEstimate: "1h" },
+      h.ctx as never,
+    );
+
+    h.setBinding(METER, "power", -4000);
+    await advance(10);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("hc");
     handle.stop();
   });
 

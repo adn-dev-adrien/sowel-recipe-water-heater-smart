@@ -200,9 +200,13 @@ const STARTUP_GRACE_MS = 90_000;
  *  human action after it has held this long (covers Zigbee round-trip lag). */
 const MANUAL_CONFIRM_MS = 60_000;
 
-/** How long the "tank is full" latch survives without any other evidence.
+/** How long the "tank is full" latch survives when nothing can corroborate it.
  *  Bounded so a stratified tank (cold probe, hot top) is re-probed instead of
- *  being locked out forever. */
+ *  being locked out forever.
+ *
+ *  With a live probe the latch lives much longer — see `tankFullMemory`: a
+ *  tank the sun filled at 15:00 is still hot at 02:00, and the probe is there
+ *  to say so. Without one, two hours of blind trust is the ceiling. */
 const TANK_FULL_TTL_MS = 2 * 60 * 60 * 1000;
 
 /** Probe drop, in °C, that invalidates the `tankFull` latch — someone drew hot
@@ -232,6 +236,18 @@ const MIN_OFF_MS = 10 * 60 * 1000;
 
 /** Safety margin added to a measured cycle before it becomes the new estimate. */
 const LEARN_MARGIN_MIN = 20;
+
+/**
+ * Shortest cycle that is allowed to teach the estimate.
+ *
+ * A top-up on an already-hot tank reaches the thermostat in minutes and says
+ * nothing about how long a full heat-up takes — but `learnEstimate` cannot
+ * tell the two apart from the duration alone, and smoothing a ten-minute
+ * cycle in drags a three-hour estimate down by an hour. Two sunny days in a
+ * row and the off-peak placement no longer covers a real heat-up. Cycles
+ * below this floor are recorded as "tank full" and teach nothing.
+ */
+const LEARN_MIN_MEASURED_MIN = 30;
 
 /** How much the estimate grows when a cycle ran out of window without ever
  *  reaching the thermostat cut-off. */
@@ -515,6 +531,16 @@ function buildSlots(): RecipeSlotDef[] {
     },
 
     {
+      id: "tankFullMemory",
+      name: "Stays hot for",
+      description: "Then heats again",
+      type: "duration",
+      required: false,
+      defaultValue: "12h",
+      group: "floor",
+    },
+
+    {
       id: "hcMode",
       name: "Placement",
       description: "Inside off-peak",
@@ -693,6 +719,10 @@ const FR: RecipeLangPack = {
     rescueTemp: {
       name: "Secours à",
       description: "Fin du secours (°C)",
+    },
+    tankFullMemory: {
+      name: "Reste chaud",
+      description: "Puis réchauffe",
     },
     hcMode: {
       name: "Placement",
@@ -899,6 +929,12 @@ export function createRecipe(): RecipeDefinition {
       const minTemp = toNumber(params.minTemp) ?? 20;
       const rescueTemp = toNumber(params.rescueTemp) ?? 25;
       const tempMaxAgeMs = ctx.helpers.parseDuration(params.tempMaxAge ?? "2h") || 2 * 3600_000;
+      // How long a probe-corroborated "tank is full" is trusted. Clamped to at
+      // least the blind TTL: a shorter value would make the probe a liability.
+      const tankFullMemoryMs = Math.max(
+        TANK_FULL_TTL_MS,
+        ctx.helpers.parseDuration(params.tankFullMemory ?? "12h") || 12 * 3600_000,
+      );
 
       const hcMode = (["late", "early", "full"] as const).includes(params.hcMode as never)
         ? (params.hcMode as "late" | "early" | "full")
@@ -1080,13 +1116,23 @@ export function createRecipe(): RecipeDefinition {
 
         if (cycleStartedAt !== null) {
           const measured = Math.max(0, Math.round((endedAt - cycleStartedAt) / 60000));
-          if (reason === "hc" || reason === "boost") {
+          // A cycle only teaches when it plausibly started from a cold tank.
+          // See LEARN_MIN_MEASURED_MIN: a top-up is short by definition, and
+          // letting it in walks the estimate down until the off-peak placement
+          // no longer covers a real heat-up.
+          const teaches =
+            (reason === "hc" || reason === "boost") && measured >= LEARN_MIN_MEASURED_MIN;
+          if (teaches) {
             hcEstimateMin = learnEstimate(hcEstimateMin, measured, true, currentWindowMin());
           }
           ctx.log(
             `Ballon chaud — thermostat coupé après ${measured} min (${
               reason ? REASON_FR[reason] : "?"
-            }). Estimation de chauffe : ${hcEstimateMin} min`,
+            }). ${
+              teaches
+                ? `Estimation de chauffe : ${hcEstimateMin} min`
+                : `Cycle trop court pour être représentatif — estimation inchangée (${hcEstimateMin} min)`
+            }`,
           );
         } else {
           ctx.log("Ballon chaud — thermostat déjà coupé");
@@ -1094,16 +1140,42 @@ export function createRecipe(): RecipeDefinition {
         persist();
       }
 
-      /** The latch only holds while it is fresh *and* the probe hasn't dropped. */
+      /**
+       * The latch only holds while it is fresh *and* the probe hasn't dropped.
+       *
+       * "Fresh" depends on what can corroborate it. With a live probe reading
+       * next to the temperature recorded at cut-off, the latch is checked
+       * against reality on every tick — a puisage drops the bottom of the tank
+       * by several degrees and clears it at once, and standing losses clear it
+       * on their own after a few hours. That evidence is worth trusting for
+       * `tankFullMemory` (12 h by default), which is what stops the recipe
+       * from re-running a full off-peak cycle at 02:00 on a tank the sun
+       * brought to the thermostat at 15:00.
+       *
+       * With no probe — or a probe gone stale, which is the same thing — there
+       * is nothing to contradict the latch, so it expires blind after
+       * `TANK_FULL_TTL_MS` exactly as before. The recipe would rather heat a
+       * hot tank (the thermostat cuts it off in minutes) than skip a cycle on
+       * an assumption nothing is checking.
+       */
       function isTankFull(temp: number | null, now: number): boolean {
         if (!tankFull || tankFullAt === null) return false;
-        if (now - tankFullAt > TANK_FULL_TTL_MS) {
+        const corroborated = temp !== null && tankFullTemp !== null;
+        const ttl = corroborated ? tankFullMemoryMs : TANK_FULL_TTL_MS;
+        if (now - tankFullAt > ttl) {
           tankFull = false;
+          if (corroborated) {
+            ctx.log(
+              `Ballon chaud depuis ${ctx.helpers.formatDuration(
+                now - tankFullAt,
+              )} — mémoire expirée, chauffe de nouveau autorisée`,
+            );
+          }
           return false;
         }
-        if (temp !== null && tankFullTemp !== null && temp <= tankFullTemp - DRAW_OFF_DELTA_C) {
+        if (corroborated && (temp as number) <= (tankFullTemp as number) - DRAW_OFF_DELTA_C) {
           tankFull = false;
-          ctx.log(`Puisage détecté (${temp.toFixed(1)} °C) — ballon considéré non plein`);
+          ctx.log(`Puisage détecté (${(temp as number).toFixed(1)} °C) — ballon considéré non plein`);
           return false;
         }
         return true;
@@ -1257,10 +1329,18 @@ export function createRecipe(): RecipeDefinition {
           }
         }
 
-        const selfDraw =
-          relayOn && (reason === "solar" || reason === "boost")
-            ? (power !== null && power > cutoffPower ? power : heaterPowerW)
-            : 0;
+        // The heater's own draw is added back whatever the reason it is
+        // running: `surplus` means "the export the meter would show with this
+        // heater off", and that statement does not depend on why the relay is
+        // closed. Restricting it to solar cycles made the surplus read as zero
+        // during an off-peak or floor run, so the recipe could not see a
+        // hand-over coming and dropped the relay for a full MIN_OFF before
+        // picking the same heat back up on the sun.
+        const selfDraw = relayOn
+          ? power !== null && power > cutoffPower
+            ? power
+            : heaterPowerW
+          : 0;
         const raw = solarSourceId
           ? readFirstNumeric(ctx.equipmentManager.getByIdWithDetails(solarSourceId), POWER_ALIASES)
           : null;
@@ -1378,8 +1458,15 @@ export function createRecipe(): RecipeDefinition {
         // 2. Off-peak bulk heating.
         if (s.inHc && s.inHcHeat) return "hc";
 
-        // 3. Free energy.
-        if (!s.inHc && solarOk) return "solar";
+        // 3. Free energy — everywhere the off-peak cycle is not already
+        //    running. The guard used to be `!s.inHc`, which silently disabled
+        //    solar heating across the whole off-peak window. That is harmless
+        //    on a night window and wrong on a daytime one: the Enedis
+        //    afternoon HC slots sit squarely in the production hours, and
+        //    refusing free watts there to wait for cheap ones is backwards.
+        //    Reaching this line already means we are outside the placement
+        //    sub-window, so the two reasons cannot fight over the relay.
+        if (solarOk) return "solar";
 
         return null;
       }
@@ -1603,6 +1690,17 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("solarStartAt", solarMode === "off" ? null : surplusStartPower);
         ctx.state.set("solarStopAt", solarMode === "off" ? null : heaterPowerW - maxGridImport);
         ctx.state.set("tankFull", tankFull);
+        // Without the expiry on screen, a skipped off-peak cycle looks like a
+        // recipe that stopped working. It is the single most surprising thing
+        // the hot-tank memory does, so it says when it ends.
+        ctx.state.set(
+          "tankFullUntil",
+          tankFull && tankFullAt !== null
+            ? new Date(
+                tankFullAt + (tankFullTemp !== null ? tankFullMemoryMs : TANK_FULL_TTL_MS),
+              ).toISOString()
+            : null,
+        );
         ctx.state.set(
           "hcWindow",
           heat ? `${minutesToHm(heat.startMin)} → ${minutesToHm(heat.endMin)}` : null,

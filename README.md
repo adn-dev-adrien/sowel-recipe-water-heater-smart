@@ -14,11 +14,22 @@ Trois raisons de chauffer, par priorité décroissante :
 
 Le plancher passe avant tout : au gîte, une série de douches en pleine journée vide le ballon hors heures creuses et sans soleil — la recette rechauffe quand même, le prix du kWh ne vaut pas de l'eau froide.
 
+Le surplus est recevable **partout où le cycle heures creuses ne tourne pas déjà**, y compris à l'intérieur de la plage HC. Sur une plage nocturne ça ne change rien — personne n'injecte à 23 h. Sur une plage HC d'après-midi (les créneaux Enedis de la mi-journée) c'est l'inverse : refuser des watts gratuits pour attendre des watts pas chers, dans les mêmes heures, n'a pas de sens.
+
 ## Détection « ballon plein »
 
 Le ballon n'expose pas de consigne haute exploitable : son thermostat s'ouvre tout seul quand l'eau est chaude. Ça se voit sur la **puissance mesurée**, qui s'effondre de ~2,2 kW à ~0 W alors que le relais est toujours fermé. Maintenu pendant `cutoffDelay`, ça vaut « ballon plein » → le relais s'ouvre et le cycle sert à affiner l'estimation de durée.
 
 La sonde du bas ne peut pas jouer ce rôle : par stratification, elle lit froid pendant que le haut du ballon est à 60 °C. C'est exactement pour ça que la puissance est le capteur principal ici, et la sonde ne garde que le plancher.
+
+### Combien de temps le ballon reste réputé chaud
+
+Une fois la coupure constatée, la recette pose un verrou « ballon plein ». Sa durée dépend de ce qui peut le contredire :
+
+- **avec une sonde vivante** — `tankFullMemory`, 12 h par défaut. La sonde est relue à chaque tick contre la température enregistrée au moment de la coupure : un puisage fait chuter le bas du ballon de plusieurs degrés et libère le verrou immédiatement, les pertes statiques finissent par le libérer toutes seules. C'est ce qui évite de refermer le relais à 3 h du matin sur un ballon que le soleil a porté au thermostat à 15 h ;
+- **sans sonde, ou sonde périmée** — 2 h, comme avant. Plus rien ne contredit le verrou, donc il expire à l'aveugle. La recette préfère chauffer un ballon déjà chaud (le thermostat la coupe en quelques minutes) que sauter un cycle sur une hypothèse que personne ne vérifie.
+
+L'échéance est publiée dans l'état de l'instance (`tankFullUntil`) : un cycle nocturne sauté est la chose la plus surprenante que fasse cette mémoire, elle dit donc quand elle s'arrête.
 
 ### La mesure doit d'abord faire ses preuves
 
@@ -51,6 +62,8 @@ L'estimation part de `hcEstimate` (4 h par défaut) puis se corrige :
 
 - cycle terminé par une coupure du thermostat → lissage vers la durée mesurée + 20 min de marge ;
 - plage fermée sans jamais atteindre la coupure → l'estimation grandit de 45 min (on sait seulement que la vérité est *plus longue*).
+
+**Un cycle de moins de 30 minutes n'enseigne rien.** Un simple appoint sur un ballon déjà chaud atteint le thermostat en quelques minutes et ne dit rien de la durée d'une chauffe complète — mais la durée seule ne permet pas de distinguer les deux. Lisser un cycle de 10 min ferait tomber une estimation de 3 h à 2 h, et deux journées ensoleillées d'affilée suffiraient à ce que le calage HC ne couvre plus jamais une vraie chauffe.
 
 **L'apprentissage exige une mesure de puissance validée.** Sans elle, `hcEstimate` est utilisée telle quelle, indéfiniment : c'est elle qui détermine la chauffe de chaque nuit. Dans ce cas, voir large. Surestimer ne coûte que quelques cycles de régulation du thermostat du ballon en tarif creux ; sous-estimer donne de l'eau tiède au réveil, tous les jours, sans rien pour le corriger.
 

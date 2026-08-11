@@ -12,7 +12,7 @@ Trois raisons de chauffer, par priorité décroissante :
 | --- | --- | --- | --- |
 | 1 | **Plancher d'eau chaude** | Sonde bas de ballon sous `minTemp` | `rescueTemp` atteinte, ou coupure du thermostat |
 | 2 | **Heures creuses** | Fenêtre HC, cycle calé en fin de plage | Coupure du thermostat, ou fin de plage |
-| 3 | **Surplus solaire** | Export ≥ puissance + marge, confirmé | Export perdu, confirmé, ou coupure du thermostat |
+| 3 | **Surplus solaire** | Réservation accordée par l'arbitre Sowel | Réservation révoquée, ou coupure du thermostat |
 
 Le plancher passe avant tout : au gîte, une série de douches en pleine journée vide le ballon hors heures creuses et sans soleil — la recette rechauffe quand même, le prix du kWh ne vaut pas de l'eau froide.
 
@@ -69,40 +69,40 @@ L'estimation part de `hcEstimate` (4 h par défaut) puis se corrige :
 
 **L'apprentissage exige une mesure de puissance validée.** Sans elle, `hcEstimate` est utilisée telle quelle, indéfiniment : c'est elle qui détermine la chauffe de chaque nuit. Dans ce cas, voir large. Surestimer ne coûte que quelques cycles de régulation du thermostat du ballon en tarif creux ; sous-estimer donne de l'eau tiède au réveil, tous les jours, sans rien pour le corriger.
 
-## Plafond physique sur le surplus
+## Le surplus solaire est arbitré par Sowel, pas par la recette
 
-En mode compteur général, renseigner aussi le compteur de production active un garde-fou : **on ne peut pas injecter plus qu'on ne produit**. Le surplus est plafonné à la production instantanée, et un écart aberrant déclenche un avertissement dans le journal.
+La recette **ne lit aucun compteur**. Elle ouvre une *réservation* auprès de l'arbitre de capacité du cœur (spec 140, Sowel ≥ 1.39) et chauffe tant que la réservation est accordée.
 
-C'est la protection contre le scénario coûteux : une pince mal orientée ou une convention de signe inversée fait lire « j'injecte 3 kW » alors qu'on soutire — et la recette allumerait 2,2 kW en heure pleine. Avec le plafond, production nulle signifie surplus nul, quoi que raconte le compteur.
+Ce n'est pas un rangement cosmétique. Une recette qui pilote sur son propre seuil d'injection **consomme le signal qu'elle observe** : fermer le relais tue l'injection qui justifiait de le fermer. On ne s'en sort qu'en réinjectant sa propre consommation dans le calcul — ce qu'une recette seule peut faire correctement, et deux non. À deux, les mêmes 800 W de surplus font démarrer le chauffe-eau *et* la pompe piscine, l'injection s'effondre, les deux s'arrêtent, et ça recommence.
 
-## Anti-oscillation solaire, et le piège du seuil unique
+L'arbitre est l'unique lecteur du compteur. Il fait cette comptabilité une fois pour toutes les charges, et distribue le surplus dans **l'ordre de priorité choisi par l'utilisateur**.
 
-Dès que le relais se ferme, le chauffe-eau mange 2,2 kW et l'injection tombe à zéro — un asservissement naïf se couperait aussitôt. La loi de commande **réinjecte la consommation du chauffe-eau dans le surplus** tant qu'il tourne pour cette raison, et les deux fronts sont temporisés (`surplusStartDelay` / `surplusStopDelay`) pour encaisser les passages nuageux.
+### Ce qu'il faut régler, et où
 
-Les deux seuils se lisent **au pied de la lettre, en watts au compteur** — aucun calcul dans la tête, aucune référence à la puissance du chauffe-eau :
+Rien dans le formulaire de la recette. Deux choses côté Sowel, une seule fois :
 
-| Seuil | Rôle | Défaut |
+1. **Équipements → le chauffe-eau → Gestion de l'énergie** : activer, classe `deferrable`, puissance nominale de la résistance.
+2. **Réglages → Administration → Énergie** : activer l'arbitrage, et placer le chauffe-eau dans la liste de priorité.
+
+Si l'une des deux manque, le journal de l'instance le dit une fois, en nommant la page. Le reste de la recette continue : **heures creuses + plancher est un mode complet, pas un mode dégradé** — c'est aussi le mode de toutes les maisons sans photovoltaïque.
+
+### Ce que la recette dit à l'arbitre
+
+| Ce qu'elle déclare | Valeur | Pourquoi |
 | --- | --- | --- |
-| `surplusStartPower` | Démarrer dès qu'on **injecte** au moins tant de watts. `2500` ⇒ le compteur doit afficher 2500 W qui partent. | 2500 W |
-| `maxGridImport` | S'arrêter dès qu'on **soutire** plus que tant de watts. Le même énoncé, côté réseau. | 200 W |
+| `watts` | Puissance du profil énergie (repli : slot `heaterPower`, puis 2200 W) | Dimensionne la décision d'enclenchement |
+| `toleratedImportW` | 10 % de la puissance, soit 220 W sur un 2,2 kW (slot `toleratedImport` pour forcer) | Une résistance est tout-ou-rien : attendre que l'injection couvre 2,2 kW *entièrement* refuse l'essentiel du surplus d'une journée pour les derniers pour-cent |
+| `slack` | `none` / `some` / `high` selon l'état du ballon | La seule chose que la liste de priorité statique ne peut pas savoir |
 
-L'état de l'instance publie `surplus`, `solarStartAt` et `solarStopAt` côte à côte, pour répondre d'un coup d'œil à « pourquoi ça n'a pas démarré ? ».
+**`slack` ne fait que descendre dans la liste, jamais monter.** C'est ce qui le rend inoffensif : personne n'a intérêt à mentir vers le bas. Un ballon à 55 °C avec les heures creuses dans six heures se met en `high` et laisse passer la pompe piscine, alors même que l'utilisateur l'a classé au-dessus. Près du plancher, ou en boost, ou quand le cycle anti-légionelle est dû, il repasse en `none` — et `none` est la seule valeur autorisée à préempter les charges du dessous.
 
-Comme le surplus contient déjà la consommation du chauffe-eau, `puissance − surplus` **est** exactement le nombre de watts pris sur le réseau à cet instant — c'est ce qui permet au seuil d'arrêt de signifier littéralement « arrête-toi dès que le réseau fournit plus que ça ».
+### La réservation reste ouverte pendant les chauffes obligatoires
 
-Les deux seuils restent **indépendants, et ce n'est pas un oubli**. Une marge unique et symétrique confondait les deux : l'élargir pour être exigeant au démarrage abaissait d'autant le seuil d'arrêt, et la recette continuait de chauffer en soutirant ce même montant — de l'électricité achetée au prix fort, sous l'étiquette « surplus solaire ». Un test verrouille ce cas.
+Quand le plancher ou le cycle heures creuses ferme le relais, la recette **garde sa réservation ouverte** au lieu de la rendre (règle auteur 5 de la spec). Une charge qui tourne sans réservation est un trou dans le surplus de l'arbitre : il compte ses 2,2 kW comme de la consommation de fond et révoque la pompe piscine sans comprendre pourquoi. Avec la réservation ouverte, l'arbitre peut l'accorder à coût nul — la consommation est déjà dans le compteur — et ses comptes redeviennent justes pour tout le monde.
 
-### Démarrer sous la puissance du chauffe-eau
+### Ce que publie l'instance
 
-C'est permis, et parfois souhaitable : démarrer un chauffe-eau de 2200 W à 2000 W d'injection tire 200 W du réseau, ce qui peut valoir mieux que d'attendre un surplus qui n'arrivera pas. Il faut alors que le soutirage toléré **couvre le manque**.
-
-`validate()` refuse la combinaison incohérente : si `puissance − seuil de démarrage` atteint déjà le seuil d'arrêt, la recette démarrerait et s'arrêterait dans la foulée, à chaque cycle, sur le contacteur. La règle est donc
-
-```
-surplusStartPower + maxGridImport > heaterPower
-```
-
-Avec 2200 W de chauffe-eau démarrant à 2000 W d'injection, il faut un soutirage toléré **strictement supérieur à 200 W**. L'erreur affichée donne le chiffre à corriger.
+`surplusClaim` (`pending` / `granted` / la raison du refus), `availableSurplus` (le surplus disponible vu par l'arbitre) et `surplusSlack`. Les anciens `surplus`, `solarStartAt` et `solarStopAt` ont disparu avec les seuils : « pourquoi ça ne chauffe pas en plein soleil ? » se lit maintenant sur une ligne, et le détail complet est dans le journal des décisions de **Énergie → En direct**.
 
 ## Modes
 
@@ -115,6 +115,9 @@ Pastille cliquable sur la ligne de la recette : **Auto** → **Boost** (chauffe 
 | Bindings du chauffe-eau | Trouvés tout seuls : alias conventionnel (`water_temperature`, `power`), sinon n'importe quel binding de la bonne catégorie. Les slots ne servent qu'à forcer un autre choix. |
 | Capteur ajouté après coup | Résolu à chaque lecture : brancher la mesure de puissance plus tard active la détection de coupure sans rééditer ni redémarrer l'instance |
 | Pas de sonde de température | Chauffe de secours désactivée, HC + solaire fonctionnent |
+| Arbitrage désactivé, chauffe-eau non déclaré, ou maison sans PV | Pas de chauffe sur surplus, dit une fois dans le journal en nommant la page à ouvrir. HC et plancher intacts |
+| Sowel < 1.39 | Idem : `ctx.helpers.energy` absent, la recette n'en dépend jamais pour fonctionner |
+| Réservation révoquée (nuage, préemption, compteur muet) | Le relais s'ouvre, la réservation **reste en file** côté cœur : rien à redemander quand le soleil revient |
 | Pas de mesure de puissance | Pas de détection de coupure : les cycles sont bornés par la plage et `maxCycle` |
 | Sonde qui remonte peu | Jugée sur son âge réel (`tempMaxAge`, 2 h par défaut), pas sur le flag `stale` de Sowel (15 min) : un ballon de plusieurs centaines de litres ne change pas de température entre deux remontées espacées |
 | Sonde muette au-delà de `tempMaxAge` | Plancher suspendu, avertissement dans le journal, reprise automatique au retour de la sonde |

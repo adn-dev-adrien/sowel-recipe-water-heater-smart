@@ -20,13 +20,24 @@
  *     *finishes* as the window closes: the water is at its hottest at wake-up
  *     and spends the fewest hours cooling down in the tank.
  *
- *  3. SOLAR SURPLUS (free energy, outside HC)
- *     Two absolute thresholds read straight off the grid meter: heat once the
- *     house exports more than `surplusStartPower`, stop once the grid supplies
- *     more than `maxGridImport`. The control law adds the heater's own draw
- *     back into the surplus while it is running, otherwise the export collapses
- *     to zero the second the relay closes and the recipe would immediately cut
- *     itself off (classic oscillation).
+ *  3. SOLAR SURPLUS (free energy)
+ *     Delegated to the core capacity arbiter (spec 140, Sowel ≥ 1.39): the
+ *     recipe holds a *claim* on the heater and heats while the claim is
+ *     granted. It never reads the grid meter itself.
+ *
+ *     This is not a refactor for tidiness. A recipe controlling on its own
+ *     export threshold consumes the signal it observes — closing the relay
+ *     kills the export that justified it — so it can only work by adding its
+ *     own draw back, which one recipe can do correctly and two cannot. The
+ *     arbiter is the single meter reader, does that accounting once for every
+ *     load, and allocates the surplus in the *user's* priority order. Two
+ *     surplus-aware recipes stop fighting over the same watts.
+ *
+ *     Nothing about the heater's configuration is solar any more: enable
+ *     arbitration on the equipment (admin) and place it in the priority list.
+ *     If that was not done, or the arbiter is off, or the home has no PV at
+ *     all, the claim is simply denied and reasons 1 and 2 carry the recipe —
+ *     off-peak plus floor is a complete mode, not a degraded one.
  *
  * ── How "the tank is full" is detected ────────────────────────────────────
  *
@@ -116,6 +127,17 @@ interface OrderBindingLite {
   enumValues?: string[];
 }
 
+/** Spec 140: present only when an admin enabled arbitration on the equipment.
+ *  Its presence is what makes the heater claimable, and `nominalPowerW` is a
+ *  better source for the resistor rating than anything this recipe can ask. */
+interface EnergyLoadProfileLite {
+  class: "comfort" | "deferrable";
+  nominalPowerW: number;
+  minOnS: number;
+  minOffS: number;
+  learned?: { watts: number; atIso: string; runs: number };
+}
+
 interface EquipmentLite {
   id: string;
   name: string;
@@ -124,6 +146,48 @@ interface EquipmentLite {
   dataBindings: DataBindingLite[];
   orderBindings: OrderBindingLite[];
   computedData?: { alias: string; value: unknown }[];
+  energyProfile?: EnergyLoadProfileLite;
+}
+
+// ── Capacity arbiter (spec 140, Sowel ≥ 1.39) ────────────────
+
+type CapacitySlack = "none" | "some" | "high";
+
+type CapacityRevokeReason =
+  | "surplus-deficit"
+  | "priority-preempted"
+  | "manual-override"
+  | "meter-stale"
+  | "disabled";
+
+type CapacityDenyReason =
+  | "not-profiled"
+  | "equipment-already-claimed"
+  | "arbiter-disabled"
+  | "override-active";
+
+interface CapacityClaimHandle {
+  readonly id: string;
+  status(): "pending" | "granted" | "denied" | "released";
+  readonly deniedReason?: CapacityDenyReason;
+  release(): void;
+}
+
+interface RecipeEnergyHelpers {
+  claimCapacity(req: {
+    equipmentId: string;
+    watts?: number;
+    toleratedImportW?: number;
+    slack?: CapacitySlack;
+    note?: string;
+    onGranted: () => void;
+    onRevoked: (reason: CapacityRevokeReason) => void;
+  }): CapacityClaimHandle;
+  getCapacityState(): {
+    enabled: boolean;
+    availableSurplusW: number | null;
+    grants: Array<{ equipmentId: string; watts: number; sinceIso: string }>;
+  };
 }
 
 interface RecipeStateStore {
@@ -159,6 +223,11 @@ interface RecipeContext {
       offPeakToday: { start: string; end: string; tariff: string }[];
       isOffPeakNow: boolean | null;
     };
+    /** Spec 140, Sowel ≥ 1.39. Always present on a supported core — the
+     *  arbiter being *off* shows up as a `arbiter-disabled` denial, not as an
+     *  absent helper. Optional here only so a mis-declared core degrades
+     *  instead of throwing. */
+    energy?: RecipeEnergyHelpers;
   };
   dispatchOrder(
     equipmentId: string,
@@ -257,11 +326,23 @@ const LEARN_GROWTH_MIN = 45;
 const LEARN_ALPHA = 0.4;
 
 const HEATER_TYPES = ["water_heater", "switch"];
-const GRID_TYPES = ["main_energy_meter", "energy_meter"];
-const PRODUCTION_TYPES = ["energy_production_meter", "solar_panel", "energy_meter"];
 
-/** Aliases tried, in order, when reading an active-power channel off a meter. */
-const POWER_ALIASES = ["power", "active_power", "power_total", "total_power", "p"];
+/**
+ * Grid the recipe accepts to buy, as a fraction of the heater's rating, when
+ * the surplus almost covers a cycle.
+ *
+ * A resistor is all-or-nothing: waiting for the export to cover 2.2 kW whole
+ * before closing the relay declines most of a day's surplus for the sake of
+ * the last few percent. The arbiter takes this as `toleratedImportW` and
+ * widens engage / narrows release by exactly that much. Scaled off the rating
+ * rather than fixed, so a 1.2 kW tank and a 3 kW tank both get a sane figure.
+ */
+const DEFAULT_IMPORT_TOLERANCE_RATIO = 0.1;
+
+/** How close to the floor the tank has to be before the recipe stops yielding
+ *  its place in the priority list. Below `minTemp + this`, a shower is close
+ *  enough to going cold that the watts are not negotiable. */
+const FLOOR_URGENCY_MARGIN_C = 5;
 
 type Reason = "floor" | "hc" | "solar" | "boost";
 type Mode = "auto" | "boost" | "off";
@@ -339,17 +420,6 @@ export function learnEstimate(
 }
 
 /**
- * Exportable surplus, in watts.
- *
- * `grid_injection` reads the main meter and flips the sign per the meter's
- * convention. The `selfDraw` term is the heater's own consumption, added back
- * because it is precisely the load we are deciding about: without it, closing
- * the relay eats the export and the next evaluation would reopen it.
- *
- * `production_only` has no such feedback (production is unaffected by the
- * heater), so `selfDraw` is ignored.
- */
-/**
  * Pick the night window out of the instance's configured off-peak slots.
  *
  * A tariff may declare several HC slots (a night one plus a midday one, say).
@@ -391,23 +461,36 @@ export function resolveBindingAlias(
   return bindings.find((b) => b.category === category)?.alias ?? null;
 }
 
-export function computeSurplus(
-  mode: "off" | "grid_injection" | "production_only",
-  reading: number | null,
-  gridSign: "import_positive" | "import_negative",
-  selfDraw: number,
-  productionW: number | null = null,
-): number | null {
-  if (mode === "off" || reading === null) return null;
-  if (mode === "production_only") return reading;
-  const exported = gridSign === "import_positive" ? -reading : reading;
-  const surplus = exported + selfDraw;
-  // Physical ceiling: without storage, a house cannot export more than it
-  // produces. When a production meter is available this caps a mis-signed or
-  // mis-wired grid clamp — the failure mode that would otherwise run 2.2 kW
-  // off the grid at peak price.
-  if (productionW === null) return surplus;
-  return Math.min(surplus, productionW);
+/**
+ * How hard the tank is asking, expressed the only way the arbiter accepts:
+ * by stepping *down* the user's priority list, never up.
+ *
+ * The user owns the order between loads; what the user cannot express in a
+ * static list is the tank's state of charge, which changes hourly and only
+ * this recipe knows. So the recipe yields when it can afford to:
+ *
+ * - `none`  — we are going to run whatever happens (floor breached, boost, or
+ *             an anti-legionella cycle is due). Claiming anyway is author
+ *             rule 5: a grant landing on an already-running load makes the
+ *             arbiter's books exact instead of leaving a hole in the surplus.
+ *             It is also the only slack allowed to preempt loads below it.
+ * - `some`  — a real heat-up is still needed today, but tonight's off-peak
+ *             window can cover it.
+ * - `high`  — the tank is essentially hot; this would be a top-up. Anything
+ *             else in the list deserves the watts more.
+ */
+export function computeSlack(input: {
+  mode: Mode;
+  temp: number | null;
+  minTemp: number;
+  needsFullCycle: boolean;
+  tankFull: boolean;
+}): CapacitySlack {
+  if (input.mode === "boost") return "none";
+  if (input.temp !== null && input.temp < input.minTemp + FLOOR_URGENCY_MARGIN_C) return "none";
+  if (input.needsFullCycle) return "none";
+  if (input.tankFull) return "high";
+  return "some";
 }
 
 function toNumber(value: unknown): number | null {
@@ -439,20 +522,16 @@ const MODE_OPTIONS = [
   { value: "full", label: "Whole window" },
 ];
 
-const SOLAR_OPTIONS = [
-  { value: "off", label: "Disabled" },
-  { value: "grid_injection", label: "Grid meter (export)" },
-  { value: "production_only", label: "Production only" },
-];
-
-const SIGN_OPTIONS = [
-  { value: "import_positive", label: "Import positive / export negative" },
-  { value: "import_negative", label: "Import negative / export positive" },
-];
-
 /**
  * NOTE — `heater` must stay the FIRST non-list `equipment` slot: the recipe
  * form resolves every `data-key` slot against that one equipment.
+ *
+ * The form is deliberately shallow. Everything solar disappeared with spec
+ * 140 — no meter, no sign convention, no thresholds, no hysteresis delays,
+ * because none of that is the recipe's business any more. What is left splits
+ * into what a household actually decides (how cold is too cold, where in the
+ * off-peak window to heat) and what only exists to accommodate a particular
+ * device, which lives under "advanced" and is meant to stay untouched.
  */
 function buildSlots(): RecipeSlotDef[] {
   return [
@@ -473,37 +552,11 @@ function buildSlots(): RecipeSlotDef[] {
       constraints: { equipmentType: HEATER_TYPES, crossZone: true, includeDescendants: true },
       group: "main",
     },
-    {
-      id: "tempKey",
-      name: "Temp. reading",
-      description: "Empty = found alone",
-      type: "data-key",
-      required: false,
-      group: "main",
-    },
-    {
-      id: "powerKey",
-      name: "Power reading",
-      description: "Empty = found alone",
-      type: "data-key",
-      required: false,
-      group: "main",
-    },
-    {
-      id: "heaterPower",
-      name: "Heater power",
-      description: "Resistor rating (W)",
-      type: "number",
-      required: false,
-      defaultValue: 2200,
-      constraints: { min: 300, max: 9000 },
-      group: "main",
-    },
 
     {
       id: "minTemp",
       name: "Rescue below",
-      description: "Heats now (°C)",
+      description: "Heats now (\u00b0C)",
       type: "number",
       required: false,
       defaultValue: 20,
@@ -511,25 +564,15 @@ function buildSlots(): RecipeSlotDef[] {
       group: "floor",
     },
     {
-      id: "tempMaxAge",
-      name: "Probe stale",
-      description: "Then ignored",
-      type: "duration",
-      required: false,
-      defaultValue: "2h",
-      group: "floor",
-    },
-    {
       id: "rescueTemp",
       name: "Rescue up to",
-      description: "Ends there (°C)",
+      description: "Ends there (\u00b0C)",
       type: "number",
       required: false,
       defaultValue: 25,
       constraints: { min: 5, max: 80 },
       group: "floor",
     },
-
     {
       id: "tankFullMemory",
       name: "Stays hot for",
@@ -571,89 +614,48 @@ function buildSlots(): RecipeSlotDef[] {
     },
 
     {
-      id: "solarMode",
-      name: "Solar surplus",
-      description: "How it is measured",
-      type: "select",
+      id: "tempKey",
+      name: "Temp. reading",
+      description: "Empty = found alone",
+      type: "data-key",
       required: false,
-      defaultValue: "off",
-      options: SOLAR_OPTIONS,
-      group: "solar",
+      group: "advanced",
     },
     {
-      id: "gridEquipment",
-      name: "Grid meter",
-      description: "Utility feed",
-      type: "equipment",
+      id: "powerKey",
+      name: "Power reading",
+      description: "Empty = found alone",
+      type: "data-key",
       required: false,
-      constraints: { equipmentType: GRID_TYPES, crossZone: true },
-      hiddenWhen: { slot: "solarMode", equals: ["off", "production_only"] },
-      group: "solar",
+      group: "advanced",
     },
     {
-      id: "gridSign",
-      name: "Meter sign",
-      description: "Export is + or −",
-      type: "select",
-      required: false,
-      defaultValue: "import_positive",
-      options: SIGN_OPTIONS,
-      hiddenWhen: { slot: "solarMode", equals: ["off", "production_only"] },
-      group: "solar",
-    },
-    {
-      id: "productionEquipment",
-      name: "PV meter",
-      description: "Production reading",
-      type: "equipment",
-      required: false,
-      constraints: { equipmentType: PRODUCTION_TYPES, crossZone: true },
-      hiddenWhen: { slot: "solarMode", equals: "off" },
-      group: "solar",
-    },
-    {
-      id: "surplusStartPower",
-      name: "Start (W)",
-      description: "Minimum export",
+      id: "heaterPower",
+      name: "Heater power",
+      description: "Blank = profile",
       type: "number",
       required: false,
-      defaultValue: 2500,
-      constraints: { min: 0, max: 10000 },
-      hiddenWhen: { slot: "solarMode", equals: "off" },
-      group: "solar",
+      constraints: { min: 300, max: 9000 },
+      group: "advanced",
     },
     {
-      id: "maxGridImport",
-      name: "Stop (W)",
-      description: "Maximum grid draw",
+      id: "toleratedImport",
+      name: "Tolerated grid",
+      description: "Blank = 10 % of load",
       type: "number",
       required: false,
-      defaultValue: 200,
       constraints: { min: 0, max: 2000 },
-      hiddenWhen: { slot: "solarMode", equals: "off" },
-      group: "solar",
+      group: "advanced",
     },
     {
-      id: "surplusStartDelay",
-      name: "Start delay",
-      description: "Surplus must hold",
+      id: "tempMaxAge",
+      name: "Probe stale",
+      description: "Then ignored",
       type: "duration",
       required: false,
-      defaultValue: "3m",
-      hiddenWhen: { slot: "solarMode", equals: "off" },
-      group: "solar",
+      defaultValue: "2h",
+      group: "advanced",
     },
-    {
-      id: "surplusStopDelay",
-      name: "Stop delay",
-      description: "Surplus stays off",
-      type: "duration",
-      required: false,
-      defaultValue: "5m",
-      hiddenWhen: { slot: "solarMode", equals: "off" },
-      group: "solar",
-    },
-
     {
       id: "cutoffPower",
       name: "Cut-off (W)",
@@ -692,99 +694,65 @@ function buildSlots(): RecipeSlotDef[] {
 const FR: RecipeLangPack = {
   name: "Chauffe-eau intelligent",
   description:
-    "Pilote un chauffe-eau on/off : plancher d'eau chaude garanti, chauffe nocturne calée en fin d'heures creuses, et chauffe opportuniste sur surplus solaire. Détecte la coupure du thermostat du ballon via la chute de puissance.",
+    "Pilote un chauffe-eau on/off : plancher d'eau chaude garanti, chauffe nocturne cal\u00e9e en fin d'heures creuses, et chauffe sur surplus solaire arbitr\u00e9 par Sowel. D\u00e9tecte la coupure du thermostat du ballon via la chute de puissance.",
   slots: {
     zone: { name: "Zone", description: "Zone du chauffe-eau" },
-    heater: { name: "Chauffe-eau", description: "Relais marche/arrêt" },
-    tempKey: {
-      name: "Mesure temp.",
-      description: "Vide = trouvée seule",
-    },
-    powerKey: {
-      name: "Mesure puiss.",
-      description: "Vide = trouvée seule",
-    },
-    heaterPower: {
-      name: "Puissance (W)",
-      description: "Nominale résistance",
-    },
+    heater: { name: "Chauffe-eau", description: "Relais marche/arr\u00eat" },
     minTemp: {
       name: "Secours sous",
-      description: "Chauffe aussitôt",
-    },
-    tempMaxAge: {
-      name: "Sonde périmée",
-      description: "Au-delà, ignorée",
+      description: "Chauffe aussit\u00f4t",
     },
     rescueTemp: {
-      name: "Secours à",
-      description: "Fin du secours (°C)",
+      name: "Secours \u00e0",
+      description: "Fin du secours (\u00b0C)",
     },
     tankFullMemory: {
       name: "Reste chaud",
-      description: "Puis réchauffe",
+      description: "Puis r\u00e9chauffe",
     },
     hcMode: {
       name: "Placement",
       description: "Dans la plage HC",
       options: {
-        late: "Fin de plage (recommandé)",
-        early: "Début de plage",
+        late: "Fin de plage (recommand\u00e9)",
+        early: "D\u00e9but de plage",
         full: "Toute la plage",
       },
     },
     hcEstimate: {
-      name: "Durée initiale",
-      description: "Affinée à l'usage",
+      name: "Dur\u00e9e initiale",
+      description: "Affin\u00e9e \u00e0 l'usage",
     },
     fullCycleEveryDays: {
       name: "Cycle complet",
       description: "Tous les N jours",
     },
-    solarMode: {
-      name: "Surplus",
-      description: "Méthode de mesure",
-      options: {
-        off: "Désactivé",
-        grid_injection: "Compteur général (injection)",
-        production_only: "Production seule",
-      },
+    tempKey: {
+      name: "Mesure temp.",
+      description: "Vide = trouv\u00e9e seule",
     },
-    gridEquipment: { name: "Compteur EDF", description: "Arrivée générale" },
-    gridSign: {
-      name: "Signe compteur",
-      description: "Injection + ou −",
-      options: {
-        import_positive: "Soutirage positif / injection négative",
-        import_negative: "Soutirage négatif / injection positive",
-      },
+    powerKey: {
+      name: "Mesure puiss.",
+      description: "Vide = trouv\u00e9e seule",
     },
-    productionEquipment: {
-      name: "Compteur PV",
-      description: "Mesure de production",
+    heaterPower: {
+      name: "Puissance (W)",
+      description: "Vide = profil",
     },
-    surplusStartPower: {
-      name: "Départ (W)",
-      description: "Injection minimale",
+    toleratedImport: {
+      name: "Soutirage OK",
+      description: "Vide = 10 % charge",
     },
-    maxGridImport: {
-      name: "Arrêt (W)",
-      description: "Soutirage maximal",
-    },
-    surplusStartDelay: {
-      name: "Délai départ",
-      description: "Surplus maintenu",
-    },
-    surplusStopDelay: {
-      name: "Délai arrêt",
-      description: "Surplus absent",
+    tempMaxAge: {
+      name: "Sonde p\u00e9rim\u00e9e",
+      description: "Au-del\u00e0, ignor\u00e9e",
     },
     cutoffPower: {
       name: "Coupure (W)",
       description: "Thermostat ouvert",
     },
     cutoffDelay: {
-      name: "Délai coupure",
+      name: "D\u00e9lai coupure",
       description: "Avant de conclure",
     },
     maxCycle: {
@@ -793,11 +761,10 @@ const FR: RecipeLangPack = {
     },
   },
   groups: {
-    main: "Équipement",
+    main: "\u00c9quipement",
     floor: "Chauffe de secours (plus d'eau chaude)",
     hc: "Heures creuses",
-    solar: "Surplus solaire",
-    advanced: "Réglages avancés",
+    advanced: "R\u00e9glages avanc\u00e9s",
   },
 };
 
@@ -810,7 +777,7 @@ export function createRecipe(): RecipeDefinition {
     id: "water-heater-smart",
     name: "Smart Water Heater",
     description:
-      "Drives an on/off water heater: hot-water floor, off-peak night cycle placed just before the window ends, and opportunistic solar-surplus heating. Detects the tank thermostat cut-off from the power draw.",
+      "Drives an on/off water heater: hot-water floor, off-peak night cycle placed just before the window ends, and solar-surplus heating arbitrated by Sowel. Detects the tank thermostat cut-off from the power draw.",
     slots: buildSlots(),
 
     actions: [
@@ -878,33 +845,12 @@ export function createRecipe(): RecipeDefinition {
         }
       }
 
-      const solarMode = String(params.solarMode ?? "off");
-      if (solarMode === "grid_injection" && !params.gridEquipment) {
-        throw new Error("Grid-injection mode needs a grid meter");
-      }
-      if (solarMode === "production_only" && !params.productionEquipment) {
-        throw new Error("Production-only mode needs a production meter");
-      }
-
-      // Both solar thresholds are absolute meter readings, so nothing stops a
-      // user from picking a pair that contradicts itself. Starting at S watts
-      // exported puts `heaterPower - S` watts on the grid the instant the relay
-      // closes; if the tolerated draw does not strictly exceed that, the stop
-      // condition is already true and the recipe would start and stop on every
-      // cycle. Catch it here rather than let it wear out a contactor.
-      if (solarMode !== "off") {
-        const heaterPowerW = toNumber(params.heaterPower) ?? 2200;
-        const startPower = toNumber(params.surplusStartPower) ?? 2500;
-        const gridImport = toNumber(params.maxGridImport) ?? 200;
-        const drawAtStart = heaterPowerW - startPower;
-        if (gridImport <= drawAtStart) {
-          throw new Error(
-            `Starting at ${startPower} W exported draws ${drawAtStart} W from the grid with a ${heaterPowerW} W heater, ` +
-              `which already meets the ${gridImport} W stop threshold — the heater would stop as soon as it starts. ` +
-              `Raise the tolerated grid draw above ${drawAtStart} W, or raise the start threshold.`,
-          );
-        }
-      }
+      // Solar validates nothing any more, because there is nothing left that
+      // can contradict itself: no meter to pick, no sign convention to get
+      // wrong, no pair of thresholds that cancel each other. The heater is
+      // claimable or it is not, the arbiter answers that at runtime, and both
+      // answers leave a working recipe — so an unprofiled heater is a line in
+      // the journal at start-up, never a refusal to create the instance.
     },
 
     createInstance(params, ctx): RecipeInstanceHandle {
@@ -924,7 +870,21 @@ export function createRecipe(): RecipeDefinition {
         const eq = heaterEq();
         return eq ? resolveBindingAlias(eq.dataBindings, powerOverride, "power", "power") : null;
       }
-      const heaterPowerW = toNumber(params.heaterPower) ?? 2200;
+      /**
+       * The resistor rating, in watts.
+       *
+       * The energy profile wins when there is one: an admin filled it to
+       * enrol the heater under arbitration, the core pre-fills it from
+       * measured power, and keeping a second copy in the recipe form is the
+       * same drift trap as the off-peak hours. The slot survives as an
+       * override for an unprofiled heater, and 2200 W is the fallback of last
+       * resort — the rating of the tank in most French homes.
+       */
+      function heaterPower(): number {
+        return (
+          toNumber(params.heaterPower) ?? heaterEq()?.energyProfile?.nominalPowerW ?? 2200
+        );
+      }
 
       const minTemp = toNumber(params.minTemp) ?? 20;
       const rescueTemp = toNumber(params.rescueTemp) ?? 25;
@@ -941,25 +901,17 @@ export function createRecipe(): RecipeDefinition {
         : "late";
       const fullCycleEveryDays = toNumber(params.fullCycleEveryDays) ?? 7;
 
-      const solarMode = (["off", "grid_injection", "production_only"] as const).includes(
-        params.solarMode as never,
-      )
-        ? (params.solarMode as "off" | "grid_injection" | "production_only")
-        : "off";
-      const gridId = params.gridEquipment ? String(params.gridEquipment) : null;
-      const productionId = params.productionEquipment ? String(params.productionEquipment) : null;
-      const gridSign =
-        params.gridSign === "import_negative" ? "import_negative" : "import_positive";
-      const surplusStartPower = toNumber(params.surplusStartPower) ?? 2500;
-      const maxGridImport = toNumber(params.maxGridImport) ?? 200;
-      const surplusStartMs = ctx.helpers.parseDuration(params.surplusStartDelay ?? "3m");
-      const surplusStopMs = ctx.helpers.parseDuration(params.surplusStopDelay ?? "5m");
-
       const cutoffPower = toNumber(params.cutoffPower) ?? 300;
       const cutoffDelayMs = ctx.helpers.parseDuration(params.cutoffDelay ?? "5m");
       const maxCycleMs = ctx.helpers.parseDuration(params.maxCycle ?? "6h");
 
-      const solarSourceId = solarMode === "grid_injection" ? gridId : productionId;
+      /** Grid the recipe accepts to buy to catch a nearly-free cycle. */
+      function toleratedImportW(): number {
+        return (
+          toNumber(params.toleratedImport) ??
+          Math.round(heaterPower() * DEFAULT_IMPORT_TOLERANCE_RATIO)
+        );
+      }
 
       // ── Volatile runtime state ────────────────────────────
 
@@ -976,8 +928,6 @@ export function createRecipe(): RecipeDefinition {
       let cyclePeakPower = 0;
       /** Persisted: the power channel has been seen carrying the heater's draw. */
       let powerProven = false;
-      let surplusOkSince: number | null = null;
-      let surplusLowSince: number | null = null;
       let mismatchSince: number | null = null;
       let manualOn = false;
 
@@ -987,6 +937,14 @@ export function createRecipe(): RecipeDefinition {
       let tankFullTemp: number | null = null;
       let lastFullCycleAt: number | null = null;
       let mode: Mode = "auto";
+
+      /** The surplus reservation held with the core arbiter, if any. */
+      let claim: CapacityClaimHandle | null = null;
+      /** Slack the live claim was opened with — re-issuing is how it changes. */
+      let claimSlack: CapacitySlack | null = null;
+      /** Set by the arbiter's callbacks. The *only* solar input this recipe has. */
+      let granted = false;
+      let lastDenial: CapacityDenyReason | null = null;
 
       /** One-shot log guards, so a permanent condition doesn't spam the journal. */
       const warned = new Set<string>();
@@ -1035,18 +993,6 @@ export function createRecipe(): RecipeDefinition {
         }
         const c = eq.computedData?.find((d) => d.alias === alias);
         return c ? toNumber(c.value) : null;
-      }
-
-      function readFirstNumeric(eq: EquipmentLite | null, aliases: string[]): number | null {
-        if (!eq) return null;
-        for (const alias of aliases) {
-          const b = eq.dataBindings.find((d) => d.alias === alias);
-          if (b) return b.stale === true ? null : toNumber(b.value);
-        }
-        // Fall back to any binding carrying a power category (vendor alias).
-        const byCategory = eq.dataBindings.find((d) => d.category === "power");
-        if (byCategory) return byCategory.stale === true ? null : toNumber(byCategory.value);
-        return null;
       }
 
       /** Actual relay state as reported by the device, or null when unknown. */
@@ -1102,6 +1048,14 @@ export function createRecipe(): RecipeDefinition {
         hc: "heures creuses",
         solar: "surplus solaire",
         boost: "boost",
+      };
+
+      const REVOKE_FR: Record<CapacityRevokeReason, string> = {
+        "surplus-deficit": "surplus insuffisant",
+        "priority-preempted": "priorité donnée à une autre charge",
+        "manual-override": "commande manuelle sur le chauffe-eau",
+        "meter-stale": "compteur muet",
+        disabled: "arbitrage désactivé",
       };
 
       /** `endedAt` is when the resistor actually stopped drawing — i.e. when the
@@ -1301,7 +1255,6 @@ export function createRecipe(): RecipeDefinition {
         nowMin: number;
         temp: number | null;
         power: number | null;
-        surplus: number | null;
         inHc: boolean;
         inHcHeat: boolean;
       }
@@ -1329,41 +1282,6 @@ export function createRecipe(): RecipeDefinition {
           }
         }
 
-        // The heater's own draw is added back whatever the reason it is
-        // running: `surplus` means "the export the meter would show with this
-        // heater off", and that statement does not depend on why the relay is
-        // closed. Restricting it to solar cycles made the surplus read as zero
-        // during an off-peak or floor run, so the recipe could not see a
-        // hand-over coming and dropped the relay for a full MIN_OFF before
-        // picking the same heat back up on the sun.
-        const selfDraw = relayOn
-          ? power !== null && power > cutoffPower
-            ? power
-            : heaterPowerW
-          : 0;
-        const raw = solarSourceId
-          ? readFirstNumeric(ctx.equipmentManager.getByIdWithDetails(solarSourceId), POWER_ALIASES)
-          : null;
-        // In grid_injection mode a production meter is optional but valuable:
-        // it turns an un-verifiable sign convention into a bounded one.
-        const productionW =
-          solarMode === "grid_injection" && productionId
-            ? readFirstNumeric(ctx.equipmentManager.getByIdWithDetails(productionId), POWER_ALIASES)
-            : null;
-        const surplus = computeSurplus(solarMode, raw, gridSign, selfDraw, productionW);
-
-        if (productionW !== null && raw !== null) {
-          const uncapped = (gridSign === "import_positive" ? -raw : raw) + selfDraw;
-          if (uncapped > productionW + heaterPowerW) {
-            warnOnce(
-              "sign-suspect",
-              `Injection annoncée (${Math.round(uncapped)} W) très supérieure à la production (${Math.round(
-                productionW,
-              )} W) — convention de signe du compteur probablement inversée. Surplus plafonné à la production.`,
-            );
-          }
-        }
-
         const nMin = nowMinutes(date);
         const hcWindow = resolveHcWindow();
         const heat = hcHeatWindow(now);
@@ -1372,67 +1290,131 @@ export function createRecipe(): RecipeDefinition {
           nowMin: nMin,
           temp,
           power,
-          surplus,
           inHc: hcWindow !== null && isWithinWindow(nMin, hcWindow.startMin, hcWindow.endMin),
           inHcHeat: heat !== null && isWithinWindow(nMin, heat.startMin, heat.endMin),
         };
       }
 
+      // ── Surplus reservation (spec 140) ────────────────────
+
       /**
-       * Surplus hysteresis. Both edges are time-confirmed so a passing cloud or
-       * a kettle doesn't toggle a 2.2 kW relay.
+       * Whether the tank has any use for free watts right now.
+       *
+       * Deliberately wider than "would heat on solar": the claim stays open
+       * while the floor or the off-peak cycle is driving the relay. That is
+       * author rule 5 — a load running without a grant is a hole in the
+       * arbiter's surplus, and a grant landing on it costs nothing and makes
+       * the books exact for everyone else in the priority list.
        */
-      function surplusWantsHeat(s: Snapshot): boolean {
-        if (solarMode === "off" || s.surplus === null) {
-          surplusOkSince = null;
-          surplusLowSince = null;
-          return false;
-        }
-        // Both thresholds are expressed in meter watts, the way a user reads
-        // them off the grid meter — start above N watts exported, stop above M
-        // watts imported. Neither is a margin relative to the heater.
-        //
-        // `surplus` is the export the meter WOULD show with the heater off: it
-        // already has the heater's own draw added back. So while the heater is
-        // off it is the raw export, and comparing it to `surplusStartPower`
-        // directly is exactly "we are exporting at least that much".
-        //
-        // Stopping is the same statement mirrored: `heaterPowerW - surplus` is
-        // the watts currently coming off the grid, so stopping below
-        // `heaterPowerW - maxGridImport` means "the grid supplies more than
-        // tolerated". Keeping the two independent matters — a single symmetric
-        // margin would tie being picky about starting to tolerating imports,
-        // i.e. buying power at peak price under the name of solar surplus.
-        //
-        // The two are only coherent if `surplusStartPower + maxGridImport`
-        // exceeds `heaterPowerW`; otherwise starting instantly satisfies the
-        // stop condition. `validate()` rejects that at configuration time.
-        const startAt = surplusStartPower;
-        const stopAt = heaterPowerW - maxGridImport;
+      function wantsCapacity(s: Snapshot): boolean {
+        return mode !== "off" && !isTankFull(s.temp, s.now);
+      }
 
-        if (relayOn && reason === "solar") {
-          if (s.surplus < stopAt) {
-            surplusLowSince ??= s.now;
-            return s.now - surplusLowSince < surplusStopMs;
+      /** A core that answers badly must not take the recipe down with it. */
+      function readCapacityState(): { enabled: boolean; availableSurplusW: number | null } | null {
+        try {
+          return ctx.helpers.energy?.getCapacityState() ?? null;
+        } catch {
+          return null;
+        }
+      }
+
+      /** Log-friendly wording for the reasons a claim can be turned down. */
+      const DENY_FR: Record<CapacityDenyReason, string> = {
+        "not-profiled":
+          "le chauffe-eau n'est pas déclaré comme charge pilotable — Équipements → le chauffe-eau → Gestion de l'énergie",
+        "arbiter-disabled":
+          "l'arbitrage du surplus est désactivé — Réglages → Administration → Énergie",
+        "equipment-already-claimed": "une autre recette a déjà réservé cet équipement",
+        "override-active": "pilotage suspendu après une commande manuelle",
+      };
+
+      /**
+       * Keep the reservation in step with what the tank needs.
+       *
+       * One claim at a time, held for as long as the need lasts: a revocation
+       * leaves it *pending* in the arbiter's queue, so the recipe never has to
+       * re-ask after losing the surplus to a cloud. Re-issuing happens only to
+       * change `slack`, and never while granted — dropping a live grant to
+       * announce a lower urgency would hand the watts away mid-cycle.
+       */
+      function syncClaim(s: Snapshot): void {
+        const energy = ctx.helpers.energy;
+        if (!energy) return;
+
+        if (!wantsCapacity(s)) {
+          if (claim) {
+            claim.release();
+            claim = null;
+            claimSlack = null;
+            granted = false;
           }
-          surplusLowSince = null;
-          return true;
+          return;
         }
 
-        if (s.surplus >= startAt) {
-          surplusOkSince ??= s.now;
-          return s.now - surplusOkSince >= surplusStartMs;
+        const slack = computeSlack({
+          mode,
+          temp: s.temp,
+          minTemp,
+          needsFullCycle: needsFullCycle(s.now),
+          tankFull,
+        });
+
+        if (claim) {
+          const live = claim.status();
+          if (live === "pending" || live === "granted") {
+            if (slack === claimSlack || live === "granted") return;
+            claim.release();
+            granted = false;
+          }
+          claim = null;
+          claimSlack = null;
         }
-        surplusOkSince = null;
-        return false;
+
+        const handle = energy.claimCapacity({
+          equipmentId: heaterId,
+          watts: heaterPower(),
+          toleratedImportW: toleratedImportW(),
+          slack,
+          note: "chauffe sur surplus",
+          onGranted: () => {
+            granted = true;
+            ctx.log("Surplus accordé par Sowel — chauffe sur le solaire");
+            void evaluate();
+          },
+          onRevoked: (why) => {
+            granted = false;
+            ctx.log(`Surplus repris par Sowel (${REVOKE_FR[why] ?? why})`);
+            void evaluate();
+          },
+        });
+
+        if (handle.status() === "denied") {
+          const why = handle.deniedReason ?? "arbiter-disabled";
+          // Worth saying once, and only once: without it "the sun is out and
+          // nothing happens" is unexplainable from the journal. Everything
+          // else about the recipe keeps working, so it is not an error.
+          if (why !== lastDenial) {
+            lastDenial = why;
+            ctx.log(`Pas de chauffe sur surplus : ${DENY_FR[why]}`);
+          }
+          claim = null;
+          claimSlack = null;
+          granted = false;
+          return;
+        }
+
+        lastDenial = null;
+        claim = handle;
+        claimSlack = slack;
       }
 
       function decide(s: Snapshot): Reason | null {
-        // Evaluated unconditionally so the hysteresis timers keep tracking even
-        // on ticks where a higher-priority reason short-circuits the decision —
-        // otherwise a stale "surplus has been fine for 3 min" would fire the
-        // moment the floor or the off-peak cycle releases the relay.
-        const solarOk = surplusWantsHeat(s);
+        // The arbiter owns this decision entirely: `granted` is set by its
+        // callbacks and nothing here looks at a meter. Hysteresis, cloud
+        // filtering and anti-short-cycling all live in core now, where they
+        // can see every load instead of this one.
+        const solarOk = granted;
 
         if (mode === "off") return null;
 
@@ -1531,7 +1513,7 @@ export function createRecipe(): RecipeDefinition {
               "peak-never-seen",
               `La mesure "${powerAlias()}" n'a jamais dépassé ${Math.round(
                 cyclePeakPower,
-              )} W pendant la chauffe (attendu ≈ ${heaterPowerW} W) — détection de coupure inactive tant qu'elle n'a pas vu le chauffe-eau consommer`,
+              )} W pendant la chauffe (attendu ≈ ${heaterPower()} W) — détection de coupure inactive tant qu'elle n'a pas vu le chauffe-eau consommer`,
             );
           }
           relayOn = false;
@@ -1604,7 +1586,7 @@ export function createRecipe(): RecipeDefinition {
         }
         if (s.power === null) return;
         if (s.power > cyclePeakPower) cyclePeakPower = s.power;
-        if (!powerProven && cyclePeakPower >= heaterPowerW * CUTOFF_MIN_PEAK_RATIO) {
+        if (!powerProven && cyclePeakPower >= heaterPower() * CUTOFF_MIN_PEAK_RATIO) {
           powerProven = true;
           ctx.state.set("powerProven", true);
           ctx.log(
@@ -1647,6 +1629,10 @@ export function createRecipe(): RecipeDefinition {
           const s = snapshot(new Date());
           reconcileManual(s);
           detectCutoff(s);
+          // After cut-off detection, so a tank that just filled releases its
+          // reservation on the same tick rather than sitting on watts the next
+          // load in the priority list could use (author rule 4).
+          syncClaim(s);
 
           const desired = enforceMaxCycle(s) ? null : decide(s);
           await apply(desired, s);
@@ -1683,12 +1669,14 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("mode", mode);
         ctx.state.set("temp", s.temp);
         ctx.state.set("power", s.power);
-        ctx.state.set("surplus", s.surplus);
-        // The thresholds are derived, not typed: without them on screen the
-        // only way to answer "why didn't it start?" is to redo the arithmetic
-        // by hand. `surplus` next to `solarStartAt` answers it at a glance.
-        ctx.state.set("solarStartAt", solarMode === "off" ? null : surplusStartPower);
-        ctx.state.set("solarStopAt", solarMode === "off" ? null : heaterPowerW - maxGridImport);
+        // Where the surplus stands, from the arbiter rather than from a
+        // threshold of our own. "Why isn't it heating in full sun?" used to
+        // need the two thresholds on screen and some mental arithmetic; now it
+        // is one line — what the claim is doing, and how much surplus is free.
+        const capacity = readCapacityState();
+        ctx.state.set("surplusClaim", claim ? claim.status() : (lastDenial ?? "none"));
+        ctx.state.set("availableSurplus", capacity?.availableSurplusW ?? null);
+        ctx.state.set("surplusSlack", claimSlack);
         ctx.state.set("tankFull", tankFull);
         // Without the expiry on screen, a skipped off-peak cycle looks like a
         // recipe that stopped working. It is the single most surprising thing
@@ -1759,20 +1747,16 @@ export function createRecipe(): RecipeDefinition {
       restore();
 
       const unsubs: Array<() => void> = [];
-      const watched = new Map<string, Set<string>>();
-      // The heater's own aliases are resolved per read, so accept any of its
-      // changes rather than pinning a set that a later binding would miss.
-      watched.set(heaterId, new Set<string>());
-      if (solarSourceId) watched.set(solarSourceId, new Set(POWER_ALIASES));
 
+      // Only the heater is watched now. The grid meter used to be subscribed
+      // here too — that subscription *was* the design flaw: a recipe reading
+      // the meter to decide whether to consume feeds back into what it reads.
       unsubs.push(
         ctx.eventBus.onType("equipment.data.changed", (event) => {
-          const eqId = String(event.equipmentId ?? "");
-          const aliases = watched.get(eqId);
-          // The heater's own relay state can be reported under any alias, so
-          // don't filter it out; only the solar source is alias-filtered.
-          if (!aliases) return;
-          if (eqId === solarSourceId && !aliases.has(String(event.alias ?? ""))) return;
+          // The heater's relay state can be reported under any alias, so take
+          // every change on it rather than pinning a set a later binding
+          // would miss.
+          if (String(event.equipmentId ?? "") !== heaterId) return;
           void evaluate();
         }),
       );
@@ -1782,12 +1766,20 @@ export function createRecipe(): RecipeDefinition {
       const heaterName = nameOf(heaterId);
       const startupWindow = resolveHcWindow();
       announceWindow(startupWindow);
+      const profile = heaterEq()?.energyProfile;
+      const capacity = readCapacityState();
       const capabilities = [
         tempAlias() ? `sonde ${tempAlias()}` : "sans sonde (chauffe de secours désactivée)",
         powerAlias()
           ? `puissance ${powerAlias()}`
           : "sans mesure de puissance (détection de coupure désactivée)",
-        solarMode === "off" ? "sans solaire" : `solaire ${solarMode} via ${nameOf(solarSourceId)}`,
+        !ctx.helpers.energy
+          ? "sans arbitrage du surplus (Sowel 1.39 minimum)"
+          : !profile
+            ? "surplus indisponible (chauffe-eau non déclaré comme charge pilotable)"
+            : capacity?.enabled === false
+              ? "surplus indisponible (arbitrage désactivé)"
+              : `surplus arbitré par Sowel (${heaterPower()} W, soutirage toléré ${toleratedImportW()} W)`,
       ].join(", ");
       ctx.log(
         `Recette démarrée sur ${heaterName} — HC ${
@@ -1823,6 +1815,16 @@ export function createRecipe(): RecipeDefinition {
             }
           }
           unsubs.length = 0;
+          // The core releases an instance's claims on stop anyway; doing it
+          // here as well keeps the arbiter's books exact through the window
+          // where the instance is gone and its replacement has not claimed yet.
+          try {
+            claim?.release();
+          } catch {
+            /* teardown must never throw */
+          }
+          claim = null;
+          granted = false;
           // The relay is deliberately left as-is: an instance restart (recipe
           // update, param edit) must not interrupt a heat-up. `restore()` picks
           // the cycle back up from persisted state.
@@ -1841,7 +1843,6 @@ export function createRecipe(): RecipeDefinition {
             // the tank is re-probed instead of being skipped.
             tankFull = false;
             tankFullAt = null;
-            surplusOkSince = null;
           }
           ctx.log(
             mode === "boost"

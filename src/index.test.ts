@@ -4,7 +4,6 @@ import {
   resolveBindingAlias,
   computeHcHeatWindow,
   pickMainOffPeakSlot,
-  computeSurplus,
   findOnOffOrderAlias,
   hmToMinutes,
   isWithinWindow,
@@ -50,6 +49,39 @@ interface HarnessOptions {
   noTariffHelper?: boolean;
   /** Makes getTariff() throw, to prove a broken core cannot break the recipe. */
   tariffThrows?: boolean;
+  /** Models a Sowel older than 1.39: `ctx.helpers.energy` does not exist. */
+  noEnergyHelper?: boolean;
+  /** What the fake arbiter answers to a claim. Default: accepts it (pending). */
+  denyClaimWith?: "not-profiled" | "equipment-already-claimed" | "arbiter-disabled" | "override-active";
+  /** `getCapacityState().enabled`. */
+  arbiterEnabled?: boolean;
+  /** Energy profile on the heater, i.e. an admin enrolled it (spec 140). */
+  heaterProfile?: {
+    class: "comfort" | "deferrable";
+    nominalPowerW: number;
+    minOnS: number;
+    minOffS: number;
+  } | null;
+}
+
+/**
+ * Stand-in for the core capacity arbiter.
+ *
+ * It deliberately implements no arbitration: the point of spec 140 is that
+ * hysteresis, reservation accounting and priority live in core, so the recipe
+ * has nothing left to test there. What is worth testing is the *contract* —
+ * that a grant heats, a revoke stops, a denial degrades gracefully, and the
+ * claim is held and released at the right moments. So the fake just records
+ * claims and lets the test pull the strings.
+ */
+interface FakeClaim {
+  equipmentId: string;
+  watts?: number;
+  toleratedImportW?: number;
+  slack?: string;
+  status: "pending" | "granted" | "denied" | "released";
+  onGranted: () => void;
+  onRevoked: (reason: string) => void;
 }
 
 /** The instance's off-peak hours, as most tests assume them. */
@@ -74,6 +106,11 @@ function buildHarness(opts: HarnessOptions = {}) {
 
   const meterBindings: Binding[] = [{ alias: "power", category: "power", value: 0 }];
 
+  const heaterProfile =
+    opts.heaterProfile === undefined
+      ? { class: "deferrable" as const, nominalPowerW: 2200, minOnS: 300, minOffS: 300 }
+      : opts.heaterProfile;
+
   const equipments: Record<string, Record<string, unknown>> = {
     [HEATER]: {
       id: HEATER,
@@ -82,6 +119,7 @@ function buildHarness(opts: HarnessOptions = {}) {
       status: "online",
       dataBindings: heaterBindings,
       orderBindings: heaterOrders,
+      ...(heaterProfile ? { energyProfile: heaterProfile } : {}),
     },
     [METER]: {
       id: METER,
@@ -105,6 +143,42 @@ function buildHarness(opts: HarnessOptions = {}) {
   const logLines: string[] = [];
   const state = new Map<string, unknown>(Object.entries(opts.initialState ?? {}));
   const dataHandlers: Array<(e: Record<string, unknown>) => void> = [];
+
+  const claims: FakeClaim[] = [];
+  const energyHelper = {
+    claimCapacity: (req: {
+      equipmentId: string;
+      watts?: number;
+      toleratedImportW?: number;
+      slack?: string;
+      onGranted: () => void;
+      onRevoked: (reason: string) => void;
+    }) => {
+      const record: FakeClaim = {
+        equipmentId: req.equipmentId,
+        watts: req.watts,
+        toleratedImportW: req.toleratedImportW,
+        slack: req.slack,
+        status: opts.denyClaimWith ? "denied" : "pending",
+        onGranted: req.onGranted,
+        onRevoked: req.onRevoked,
+      };
+      claims.push(record);
+      return {
+        id: `claim-${claims.length}`,
+        status: () => record.status,
+        deniedReason: opts.denyClaimWith,
+        release: () => {
+          if (record.status !== "denied") record.status = "released";
+        },
+      };
+    },
+    getCapacityState: () => ({
+      enabled: opts.arbiterEnabled ?? true,
+      availableSurplusW: 1500,
+      grants: [] as Array<{ equipmentId: string; watts: number; sinceIso: string }>,
+    }),
+  };
 
   function setBinding(eqId: string, alias: string, value: unknown): void {
     const eq = equipments[eqId] as { dataBindings: Binding[] };
@@ -147,6 +221,7 @@ function buildHarness(opts: HarnessOptions = {}) {
               return opts.tariff ?? DEFAULT_TARIFF;
             },
           }),
+      ...(opts.noEnergyHelper ? {} : { energy: energyHelper }),
     },
     dispatchOrder: async (equipmentId: string, alias: string, value: unknown) => {
       orderCalls.push({ equipmentId, alias, value });
@@ -172,6 +247,21 @@ function buildHarness(opts: HarnessOptions = {}) {
     setBinding,
     /** Last order sent to the heater, or undefined. */
     lastOrder: () => orderCalls[orderCalls.length - 1],
+    claims,
+    /** The claim the recipe currently holds, if it holds one. */
+    liveClaim: () => claims.find((c) => c.status === "pending" || c.status === "granted"),
+    grant: () => {
+      const c = claims.find((x) => x.status === "pending");
+      if (!c) throw new Error("no pending claim to grant");
+      c.status = "granted";
+      c.onGranted();
+    },
+    revoke: (reason = "surplus-deficit") => {
+      const c = claims.find((x) => x.status === "granted");
+      if (!c) throw new Error("no granted claim to revoke");
+      c.status = "pending"; // core leaves a revoked claim queued
+      c.onRevoked(reason);
+    },
     fireDataChanged: (equipmentId: string, alias: string) => {
       for (const h of [...dataHandlers]) h({ equipmentId, alias });
     },
@@ -199,20 +289,16 @@ function parseDurationLike(value: unknown): number {
   }
 }
 
+/** The form as a user now fills it: no solar anything, and the heater rating
+ *  left to the energy profile. */
 const BASE_PARAMS: Record<string, unknown> = {
   zone: "zone-1",
   heater: HEATER,
-  heaterPower: 2200,
   minTemp: 20,
   rescueTemp: 25,
   hcMode: "late",
   hcEstimate: "3h",
   fullCycleEveryDays: 0,
-  solarMode: "off",
-  surplusStartPower: 2400,
-  maxGridImport: 200,
-  surplusStartDelay: "3m",
-  surplusStopDelay: "5m",
   cutoffPower: 300,
   cutoffDelay: "5m",
   maxCycle: "5h",
@@ -363,42 +449,6 @@ describe("resolveBindingAlias", () => {
   });
 });
 
-describe("computeSurplus", () => {
-  it("is null when solar is disabled or the reading is missing", () => {
-    expect(computeSurplus("off", 1000, "import_positive", 0)).toBeNull();
-    expect(computeSurplus("grid_injection", null, "import_positive", 0)).toBeNull();
-  });
-
-  it("reads export off a grid meter, honouring the sign convention", () => {
-    expect(computeSurplus("grid_injection", -3000, "import_positive", 0)).toBe(3000);
-    expect(computeSurplus("grid_injection", 3000, "import_negative", 0)).toBe(3000);
-    expect(computeSurplus("grid_injection", 1500, "import_positive", 0)).toBe(-1500);
-  });
-
-  it("adds the heater's own draw back so it doesn't cut itself off", () => {
-    // Exporting 3 kW, relay closes and eats 2.2 kW: raw export collapses to
-    // 800 W but the *available* surplus is still 3 kW.
-    expect(computeSurplus("grid_injection", -800, "import_positive", 2200)).toBe(3000);
-  });
-
-  it("ignores the self-draw term in production-only mode", () => {
-    expect(computeSurplus("production_only", 2500, "import_positive", 2200)).toBe(2500);
-  });
-
-  it("caps the surplus at production — a house cannot export what it never made", () => {
-    // Sign convention inverted: the meter says "exporting 3 kW" at night.
-    expect(computeSurplus("grid_injection", -3000, "import_positive", 0, 0)).toBe(0);
-    // Genuine surplus, below production: left untouched.
-    expect(computeSurplus("grid_injection", -1500, "import_positive", 0, 4000)).toBe(1500);
-    // Claimed export above production: clamped to what the panels deliver.
-    expect(computeSurplus("grid_injection", -5000, "import_positive", 0, 3000)).toBe(3000);
-  });
-
-  it("leaves a negative surplus negative when capping", () => {
-    expect(computeSurplus("grid_injection", 1200, "import_positive", 0, 0)).toBe(-1200);
-  });
-});
-
 describe("findOnOffOrderAlias", () => {
   const eq = (orders: { alias: string; type?: string; category?: string; enumValues?: string[] }[]) =>
     ({ id: "x", name: "x", type: "switch", dataBindings: [], orderBindings: orders }) as never;
@@ -496,30 +546,13 @@ describe("validate", () => {
     );
   });
 
-  it("rejects a solar mode with no meter behind it", () => {
-    const { ctx } = buildHarness();
-    expect(() =>
-      createRecipe().validate({ ...BASE_PARAMS, solarMode: "grid_injection" }, ctx as never),
-    ).toThrow(/grid meter/);
-  });
-
-  it("rejects thresholds that would stop the heater as soon as it starts", () => {
-    // 2200 W heater started at 2000 W exported draws 200 W from the grid, which
-    // already meets a 200 W stop threshold: the relay would chatter.
-    const { ctx } = buildHarness();
-    expect(() =>
-      createRecipe().validate(
-        {
-          ...BASE_PARAMS,
-          solarMode: "grid_injection",
-          gridEquipment: METER,
-          heaterPower: 2200,
-          surplusStartPower: 2000,
-          maxGridImport: 200,
-        },
-        ctx as never,
-      ),
-    ).toThrow(/stop as soon as it starts/);
+  it("accepts a heater nobody enrolled under arbitration", () => {
+    // The whole class of solar misconfiguration is gone: no meter to pick, no
+    // sign convention to get wrong, no pair of thresholds that cancel out. An
+    // unprofiled heater is a recipe without surplus heating, which is a
+    // complete recipe — so it must not block creating the instance.
+    const { ctx } = buildHarness({ heaterProfile: null });
+    expect(() => createRecipe().validate(BASE_PARAMS, ctx as never)).not.toThrow();
   });
 
   it("accepts the same thresholds once the tolerated draw clears the shortfall", () => {
@@ -1013,292 +1046,268 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  // ── 4. Solar surplus ─────────────────────────────────────
+  // ── 4. Solar surplus, via the core arbiter (spec 140) ────
+  //
+  // The recipe no longer decides anything about the surplus: it opens a claim
+  // and obeys the callbacks. So there is nothing here about thresholds,
+  // hysteresis or meter signs — all of that moved into core, where it can see
+  // every load instead of this one. What is left to pin down is the contract.
 
-  const SOLAR_PARAMS = {
-    ...BASE_PARAMS,
-    solarMode: "grid_injection",
-    gridEquipment: METER,
-    gridSign: "import_positive",
-  };
-
-  it("waits for the surplus to be confirmed before closing the relay", async () => {
+  it("heats when the arbiter grants the claim, and stops when it revokes", async () => {
     at("2026-08-09T13:00:00");
     const h = buildHarness();
-    const handle = createRecipe().createInstance(SOLAR_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.orderCalls).toHaveLength(0); // pending is not granted
 
-    h.setBinding(METER, "power", -2500); // exporting 2.5 kW > 2200 + 200
-    await advance(2); // under the 3 min confirmation
-    expect(h.orderCalls).toHaveLength(0);
+    h.grant();
+    await advance(1);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("solar");
 
+    await advance(6); // clear MIN_ON
+    h.revoke();
+    await advance(1);
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    handle.stop();
+  });
+
+  it("claims the heater's rating and a tolerated grid draw, both from the profile", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({
+      heaterProfile: { class: "deferrable", nominalPowerW: 3000, minOnS: 300, minOffS: 300 },
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    // Nothing in the form said 3000 W: the energy profile is the source of
+    // truth for the rating, exactly as the tariff page is for off-peak hours.
+    expect(h.liveClaim()).toMatchObject({ watts: 3000, toleratedImportW: 300 });
+    handle.stop();
+  });
+
+  it("lets the form override the tolerated grid draw", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, toleratedImport: 0 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.liveClaim()?.toleratedImportW).toBe(0);
+    handle.stop();
+  });
+
+  it("yields its place in the priority list when the tank is essentially hot", async () => {
+    // High slack is the recipe telling the arbiter "serve the pool pump first".
+    // Only this recipe knows the tank's state of charge; the user's static
+    // priority list cannot express "unless it is nearly hot".
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({
+      initialState: {
+        tankFull: true,
+        tankFullAt: new Date("2026-08-09T12:50:00").toISOString(),
+        tankFullTemp: 58,
+      },
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 57 },
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    // A full tank wants nothing at all — the watts belong to the next load.
+    expect(h.liveClaim()).toBeUndefined();
+    handle.stop();
+  });
+
+  it("stops yielding when the tank approaches the floor", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 22 }, // floor 20 + margin 5
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.liveClaim()?.slack).toBe("none");
+    handle.stop();
+  });
+
+  it("keeps its claim open while the floor forces it to run anyway", async () => {
+    // Author rule 5: a load running without a grant is a hole in the arbiter's
+    // surplus. Holding the claim lets a grant land on it and makes the books
+    // exact for every other load in the list.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 12 }, // below the floor
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
     await advance(2);
+
+    expect(h.state.get("reason")).toBe("floor");
     expect(h.lastOrder()).toMatchObject({ value: true });
-    expect(h.state.get("reason")).toBe("solar");
+    expect(h.liveClaim()).toBeDefined();
+    expect(h.liveClaim()?.slack).toBe("none");
     handle.stop();
   });
 
-  it("does not cut itself off when its own draw eats the export", async () => {
-    at("2026-08-09T13:00:00");
+  it("keeps its claim open through the off-peak cycle", async () => {
+    at("2026-08-10T03:00:00"); // inside the late placement window
     const h = buildHarness();
-    const handle = createRecipe().createInstance(SOLAR_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
 
-    h.setBinding(METER, "power", -2500);
-    await advance(4);
-    expect(h.lastOrder()).toMatchObject({ value: true });
-
-    // Relay closed: export collapses to 300 W, but the heater is the one
-    // eating it. Effective surplus is still 2500 W → keep heating.
-    h.setBinding(METER, "power", -300);
-    await advance(10);
-    expect(h.state.get("relayOn")).toBe(true);
+    expect(h.state.get("reason")).toBe("hc");
+    expect(h.liveClaim()).toBeDefined();
     handle.stop();
   });
 
-  it("rides out a passing cloud, then stops when the surplus is really gone", async () => {
-    at("2026-08-09T13:00:00");
+  it("releases the claim as soon as the tank is full", async () => {
+    at("2026-08-10T03:00:00");
     const h = buildHarness();
-    const handle = createRecipe().createInstance(SOLAR_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.liveClaim()).toBeDefined();
 
-    h.setBinding(METER, "power", -2500);
-    await advance(4);
-    expect(h.state.get("relayOn")).toBe(true);
-
-    h.setBinding(METER, "power", 1500); // importing: effective surplus 700 W
-    await advance(3); // under the 5 min loss delay
-    expect(h.state.get("relayOn")).toBe(true);
-
-    await advance(3);
-    expect(h.lastOrder()).toMatchObject({ value: false });
-    handle.stop();
-  });
-
-  it("refuses to heat on a mis-signed meter when production contradicts it", async () => {
-    // Evening: the grid clamp claims a 3 kW export while the panels make
-    // nothing. The production cap turns a costly mistake into a no-op.
-    at("2026-08-09T20:00:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, productionEquipment: PRODUCTION },
-      h.ctx as never,
-    );
-
-    h.setBinding(METER, "power", -3000);
-    h.setBinding(PRODUCTION, "power", 0);
-    await advance(10);
-
-    expect(h.orderCalls).toHaveLength(0);
-    expect(h.state.get("surplus")).toBe(0);
-    expect(h.logLines.some((l) => l.includes("signe"))).toBe(true);
-    handle.stop();
-  });
-
-  it("heats normally when production backs the announced export", async () => {
-    at("2026-08-09T13:00:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, productionEquipment: PRODUCTION },
-      h.ctx as never,
-    );
-
-    h.setBinding(METER, "power", -2500);
-    h.setBinding(PRODUCTION, "power", 4000);
-    await advance(4);
-
-    expect(h.lastOrder()).toMatchObject({ value: true });
-    expect(h.state.get("reason")).toBe("solar");
-    handle.stop();
-  });
-
-  it("stops as soon as the grid supplies more than tolerated", async () => {
-    at("2026-08-09T13:00:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(SOLAR_PARAMS, h.ctx as never);
-
-    h.setBinding(METER, "power", -2500);
-    await advance(4);
-    expect(h.state.get("relayOn")).toBe(true);
-
-    // Importing 500 W — above the 200 W tolerance, so this is a purchase, not
-    // a surplus. Effective surplus 2200-500 = 1700 < stop threshold 2000.
-    h.setBinding(METER, "power", 500);
+    await advance(89);
+    h.setBinding(HEATER, "power", 4); // thermostat opens
     await advance(6);
-    expect(h.lastOrder()).toMatchObject({ value: false });
+
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.liveClaim()).toBeUndefined(); // watts handed back to the next load
     handle.stop();
   });
 
-  it("keeps heating through a grid draw within tolerance", async () => {
+  it("releases the claim when the recipe is paused, and re-claims on resume", async () => {
     at("2026-08-09T13:00:00");
     const h = buildHarness();
-    const handle = createRecipe().createInstance(SOLAR_PARAMS, h.ctx as never);
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.liveClaim()).toBeDefined();
 
-    h.setBinding(METER, "power", -2500);
-    await advance(4);
-    expect(h.state.get("relayOn")).toBe(true);
+    handle.onAction?.("set_mode", { mode: "off" });
+    await advance(1);
+    expect(h.liveClaim()).toBeUndefined();
 
-    h.setBinding(METER, "power", 100); // under the 200 W tolerance
-    await advance(10);
-    expect(h.state.get("relayOn")).toBe(true);
+    handle.onAction?.("set_mode", { mode: "auto" });
+    await advance(1);
+    expect(h.liveClaim()).toBeDefined();
     handle.stop();
   });
 
-  it("a picky start threshold does not licence buying power to keep going", async () => {
-    // The regression a single symmetric margin caused: widening it to be
-    // selective about starting also dragged the stop threshold down, so the
-    // recipe kept heating while importing ~2 kW at peak price. The two
-    // thresholds are independent precisely so that cannot happen again.
+  it("releases the claim when the instance stops", async () => {
     at("2026-08-09T13:00:00");
     const h = buildHarness();
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, surplusStartPower: 4200 },
-      h.ctx as never,
-    );
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.liveClaim()).toBeDefined();
 
-    h.setBinding(METER, "power", -4500); // exporting 4500 >= 4200, starts
-    await advance(4);
-    expect(h.state.get("relayOn")).toBe(true);
-
-    h.setBinding(METER, "power", 1800); // importing 1.8 kW
-    await advance(6);
-    expect(h.lastOrder()).toMatchObject({ value: false });
     handle.stop();
+    expect(h.liveClaim()).toBeUndefined();
   });
 
-  it("holds out for a comfortable export when the start threshold is high", async () => {
+  it("does not re-issue a claim just to lower its urgency mid-grant", async () => {
+    // Releasing a live grant to announce more slack would hand the watts away
+    // in the middle of a cycle — the opposite of what the slack is for.
     at("2026-08-09T13:00:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, surplusStartPower: 4200 },
-      h.ctx as never,
-    );
-
-    h.setBinding(METER, "power", -3000); // exporting 3000 < 4200 — not enough
-    await advance(10);
-    expect(h.orderCalls).toHaveLength(0);
-    handle.stop();
-  });
-
-  it("reads the start threshold as raw exported watts, not a margin", async () => {
-    // The whole point of the parameter: 2500 means "the meter shows 2500 W
-    // going out", with no arithmetic against the heater power.
-    at("2026-08-09T13:00:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartPower: 2500 },
-      h.ctx as never,
-    );
-
-    h.setBinding(METER, "power", -2400); // 2400 < 2500 — just short
-    await advance(10);
-    expect(h.orderCalls).toHaveLength(0);
-
-    h.setBinding(METER, "power", -2500); // exactly on the threshold
-    await advance(4);
-    expect(h.lastOrder()).toMatchObject({ value: true });
-    handle.stop();
-  });
-
-  it("starts below the heater power when the tolerated grid draw covers it", async () => {
-    // 2200 W heater started at 2000 W exported puts 200 W on the grid, which a
-    // 400 W tolerance absorbs — so it starts AND keeps running.
-    at("2026-08-09T13:00:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartPower: 2000, maxGridImport: 400 },
-      h.ctx as never,
-    );
-
-    h.setBinding(METER, "power", -2000);
-    await advance(4);
-    expect(h.lastOrder()).toMatchObject({ value: true });
-
-    // Export collapsed to the 200 W draw the heater itself created: surplus is
-    // back to 2000, above the 1800 stop threshold, so it must hold.
-    h.setBinding(METER, "power", 200);
-    await advance(10);
-    expect(h.lastOrder()).toMatchObject({ value: true });
-    handle.stop();
-  });
-
-  it("publishes the thresholds it is actually comparing against", async () => {
-    // "Why didn't it start?" must be answerable from the instance state alone.
-    at("2026-08-09T13:00:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartPower: 4000, maxGridImport: 200 },
-      h.ctx as never,
-    );
-
-    h.setBinding(METER, "power", -1989); // exactly the reported situation
-    await advance(10);
-
-    expect(h.state.get("surplus")).toBe(1989);
-    expect(h.state.get("solarStartAt")).toBe(4000);
-    expect(h.state.get("solarStopAt")).toBe(2000);
-    expect(h.orderCalls).toHaveLength(0);
-    handle.stop();
-  });
-
-  it("starts on a modest export once the threshold is sized sensibly", async () => {
-    at("2026-08-09T13:00:00");
-    const h = buildHarness();
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, heaterPower: 2200, surplusStartPower: 2500 },
-      h.ctx as never,
-    );
-
-    h.setBinding(METER, "power", -2600); // exporting 2600 >= 2500
-    await advance(4);
-    expect(h.lastOrder()).toMatchObject({ value: true });
-    handle.stop();
-  });
-
-  /**
-   * Solar used to be switched off across the whole off-peak window. That is
-   * invisible on a night window — nothing is exporting at 23:00 — and wrong on
-   * a daytime one: the Enedis afternoon HC slots sit in full production, and
-   * declining free watts there to wait for cheap ones inverts the point.
-   */
-  it("heats on solar inside the off-peak window, outside the placement cycle", async () => {
-    at("2026-08-09T12:30:00"); // inside a midday HC slot, before the late cycle
     const h = buildHarness({
-      tariff: {
-        configured: true,
-        offPeakToday: [{ start: "11:00", end: "16:00", tariff: "hc" }],
-        isOffPeakNow: true,
-      },
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 22 },
+        { alias: "power", category: "power", value: 0 },
+      ],
     });
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, hcEstimate: "1h" }, // placement = 15:00 → 16:00
-      h.ctx as never,
-    );
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.liveClaim()?.slack).toBe("none");
 
-    h.setBinding(METER, "power", -4000);
-    await advance(10);
-    expect(h.lastOrder()).toMatchObject({ value: true });
-    expect(h.state.get("reason")).toBe("solar");
+    h.grant();
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 50); // urgency drops while granted
+    await advance(2);
+
+    expect(h.claims).toHaveLength(1);
+    expect(h.liveClaim()?.status).toBe("granted");
     handle.stop();
   });
 
-  it("lets the placement cycle own the relay when both reasons apply", async () => {
-    at("2026-08-09T15:30:00"); // inside the placement sub-window
-    const h = buildHarness({
-      tariff: {
-        configured: true,
-        offPeakToday: [{ start: "11:00", end: "16:00", tariff: "hc" }],
-        isOffPeakNow: true,
-      },
-    });
-    const handle = createRecipe().createInstance(
-      { ...SOLAR_PARAMS, hcEstimate: "1h" },
-      h.ctx as never,
-    );
+  it("carries on without surplus when the heater was never enrolled", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({ heaterProfile: null, denyClaimWith: "not-profiled" });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
 
-    h.setBinding(METER, "power", -4000);
-    await advance(10);
+    // Off-peak still runs: tariff-only is a complete mode, not a degraded one.
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("hc");
+    expect(h.logLines.some((l) => l.includes("Gestion de l'énergie"))).toBe(true);
+    handle.stop();
+  });
+
+  it("says once, and only once, why there is no surplus heating", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({ denyClaimWith: "arbiter-disabled" });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(5); // ten ticks
+
+    const said = h.logLines.filter((l) => l.startsWith("Pas de chauffe sur surplus"));
+    expect(said).toHaveLength(1);
+    handle.stop();
+  });
+
+  it("runs its off-peak and floor duties on a core with no arbiter at all", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({ noEnergyHelper: true });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
     expect(h.lastOrder()).toMatchObject({ value: true });
     expect(h.state.get("reason")).toBe("hc");
     handle.stop();
   });
+
+  it("degrades to off-peak only when the grant is revoked mid-cycle", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    h.grant();
+    await advance(6);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    h.revoke("priority-preempted");
+    await advance(1);
+
+    expect(h.state.get("relayOn")).toBe(false);
+    expect(h.logLines.some((l) => l.includes("priorité donnée à une autre charge"))).toBe(true);
+    // The claim stays queued: core leaves a revoked claim pending, so the
+    // recipe never has to re-ask after losing the surplus to a cloud.
+    expect(h.liveClaim()).toBeDefined();
+    handle.stop();
+  });
+
+  it("publishes what the claim is doing instead of thresholds to redo by hand", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("surplusClaim")).toBe("pending");
+    expect(h.state.get("availableSurplus")).toBe(1500);
+
+    h.grant();
+    await advance(1);
+    expect(h.state.get("surplusClaim")).toBe("granted");
+    handle.stop();
+  });
+
 
   // ── 5. Relay protection, manual override, restarts ───────
 

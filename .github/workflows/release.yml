@@ -16,6 +16,20 @@ jobs:
         with:
           node-version: 20
 
+      # A tag that disagrees with the manifest ships a package Sowel installs
+      # under one version and reports as another. Cheap to check, confusing to
+      # debug on an instance.
+      - name: Versions agree with the tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          for f in manifest.json package.json; do
+            HAVE=$(node -p "require('./$f').version")
+            if [ "$HAVE" != "$VERSION" ]; then
+              echo "::error::$f says $HAVE, tag says $VERSION"
+              exit 1
+            fi
+          done
+
       - run: npm ci
 
       - run: npm test
@@ -30,13 +44,33 @@ jobs:
           RECIPE_ID=$(node -p "require('./manifest.json').id")
           tar czf sowel-recipe-${RECIPE_ID}-${VERSION}.tar.gz manifest.json package.json dist/
 
+      # Idempotent on purpose. `gh release create` also creates the tag, so
+      # publishing a release by hand triggers this very workflow, which then
+      # found its own release already there and failed — every release since
+      # v0.6.0 went red that way.
+      #
+      # The one thing this step must never do is replace an asset that already
+      # exists. Personal sources pin the tarball by sha256 at install (spec
+      # 136), and a second tarball built here would not be byte-identical to
+      # the one somebody already confirmed: re-downloads would fail with
+      # ChecksumMismatchError. So an existing asset is success, and an existing
+      # release *without* the asset is a hard error rather than a guess.
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           RECIPE_ID=$(node -p "require('./manifest.json').id")
-          gh release create ${{ github.ref_name }} \
-            sowel-recipe-${RECIPE_ID}-${VERSION}.tar.gz \
-            --title "${{ github.ref_name }}" \
+          ASSET="sowel-recipe-${RECIPE_ID}-${VERSION}.tar.gz"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            if gh release view "$GITHUB_REF_NAME" --json assets \
+                 --jq '.assets[].name' | grep -qx "$ASSET"; then
+              echo "Release $GITHUB_REF_NAME already publishes $ASSET — nothing to do."
+              exit 0
+            fi
+            echo "::error::Release $GITHUB_REF_NAME exists without $ASSET. Refusing to publish a second tarball over a pinned one — upload it by hand or cut a new version."
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "$ASSET" \
+            --title "$GITHUB_REF_NAME" \
             --generate-notes

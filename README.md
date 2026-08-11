@@ -1,5 +1,7 @@
 # sowel-recipe-water-heater-smart
 
+> **Publier une version** : bumper `manifest.json` + `package.json`, committer, puis `git tag vX.Y.Z && git push origin vX.Y.Z`. Le workflow `Release` teste, build, empaquette et crée la release GitHub. Ne pas lancer `gh release create` à la main : la commande crée aussi le tag, ce qui déclenche le workflow, qui trouvait alors sa propre release déjà là et échouait.
+
 Recette Sowel pour piloter un **chauffe-eau électrique** derrière un simple relais marche/arrêt (Zigbee, Tasmota, …), sans consigne de température : c'est le thermostat mécanique du ballon qui décide de la température finale, la recette décide seulement **quand** la résistance a le droit de consommer.
 
 ## Ce que ça fait

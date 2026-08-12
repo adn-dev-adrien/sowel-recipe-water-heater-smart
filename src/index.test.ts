@@ -55,6 +55,8 @@ interface HarnessOptions {
   denyClaimWith?: "not-profiled" | "equipment-already-claimed" | "arbiter-disabled" | "override-active";
   /** `getCapacityState().enabled`. */
   arbiterEnabled?: boolean;
+  /** `getCapacityState().availableSurplusW` — >0 means the sun is producing. */
+  availableSurplusW?: number | null;
   /** Energy profile on the heater, i.e. an admin enrolled it (spec 140). */
   heaterProfile?: {
     class: "comfort" | "deferrable";
@@ -144,6 +146,8 @@ function buildHarness(opts: HarnessOptions = {}) {
   const state = new Map<string, unknown>(Object.entries(opts.initialState ?? {}));
   const dataHandlers: Array<(e: Record<string, unknown>) => void> = [];
 
+  let surplusW: number | null = opts.availableSurplusW === undefined ? 1500 : opts.availableSurplusW;
+
   const claims: FakeClaim[] = [];
   const energyHelper = {
     claimCapacity: (req: {
@@ -175,7 +179,7 @@ function buildHarness(opts: HarnessOptions = {}) {
     },
     getCapacityState: () => ({
       enabled: opts.arbiterEnabled ?? true,
-      availableSurplusW: 1500,
+      availableSurplusW: surplusW,
       grants: [] as Array<{ equipmentId: string; watts: number; sinceIso: string }>,
     }),
   };
@@ -248,6 +252,10 @@ function buildHarness(opts: HarnessOptions = {}) {
     /** Last order sent to the heater, or undefined. */
     lastOrder: () => orderCalls[orderCalls.length - 1],
     claims,
+    /** Move the arbiter's reported surplus, i.e. the sun coming up. */
+    sunUp: (w: number | null) => {
+      surplusW = w;
+    },
     /** The claim the recipe currently holds, if it holds one. */
     liveClaim: () => claims.find((c) => c.status === "pending" || c.status === "granted"),
     grant: () => {
@@ -932,6 +940,143 @@ describe("createInstance", () => {
     expect(h.lastOrder()).toMatchObject({ value: false });
     // 0.6 * 180 + 0.4 * (90 + 20) = 152
     expect(h.state.get("hcEstimateMin")).toBe(152);
+    handle.stop();
+  });
+
+  // ── Cut-off inferred from the household total ────────────
+
+  /** A heater with no meter of its own: the whole point of the fallback. */
+  const NO_POWER_BINDINGS = [
+    { alias: "state", category: "light_state", value: "OFF" },
+    { alias: "water_temperature", category: "temperature", value: 45 },
+  ];
+
+  it("concludes the tank is full when the household total drops below the declared power", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({ heaterBindings: NO_POWER_BINDINGS, availableSurplusW: 0 });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, gridEquipment: METER },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+
+    h.setBinding(METER, "power", 2400); // resistor + a bit of background
+    await advance(30);
+    expect(h.state.get("householdProven")).toBe(true);
+    expect(h.state.get("tankFull")).toBeFalsy();
+
+    h.setBinding(METER, "power", 250); // thermostat opened
+    await advance(6); // > 5 min cut-off delay
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    handle.stop();
+  });
+
+  it("releases the arbiter reservation on the same tick as the cut-off", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({ heaterBindings: NO_POWER_BINDINGS, availableSurplusW: 0 });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, gridEquipment: METER },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.setBinding(METER, "power", 2400);
+    await advance(30);
+    expect(h.claims.some((c) => c.status === "pending" || c.status === "granted")).toBe(true);
+
+    h.setBinding(METER, "power", 250);
+    await advance(6);
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.claims.every((c) => c.status === "released")).toBe(true);
+    handle.stop();
+  });
+
+  it("never concludes from a meter that has not been seen carrying the heater", async () => {
+    // A sub-meter that does not cover the water heater reads low forever. It
+    // must leave the recipe alone, not declare a full tank every cycle.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({ heaterBindings: NO_POWER_BINDINGS, availableSurplusW: 0 });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, gridEquipment: METER },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.setBinding(METER, "power", 300); // never reaches 0.9 * 2200
+    await advance(40);
+
+    expect(h.state.get("householdProven")).toBeFalsy();
+    expect(h.state.get("tankFull")).toBeFalsy();
+    expect(h.state.get("relayOn")).toBe(true);
+    handle.stop();
+  });
+
+  it("stands down while the sun produces and no production meter is bound", async () => {
+    // Grid alone is not the household total under PV: 2.2 kW covered by the
+    // panels reads ~0 W at the grid, exactly like a tank that just filled.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({ heaterBindings: NO_POWER_BINDINGS, availableSurplusW: 0 });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, gridEquipment: METER },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.setBinding(METER, "power", 2400);
+    await advance(30);
+    expect(h.state.get("householdProven")).toBe(true);
+
+    h.sunUp(1500); // arbiter now reports surplus, production meter still absent
+    h.setBinding(METER, "power", 0);
+    await advance(10);
+
+    expect(h.state.get("householdPower")).toBeNull();
+    expect(h.state.get("tankFull")).toBeFalsy();
+    handle.stop();
+  });
+
+  it("adds production back in when the production meter is bound", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({ heaterBindings: NO_POWER_BINDINGS, availableSurplusW: 1500 });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, gridEquipment: METER, productionEquipment: PRODUCTION },
+      h.ctx as never,
+    );
+    await advance(1);
+
+    // Exporting 300 W while producing 2500: the house is drawing 2200.
+    h.setBinding(METER, "power", -300);
+    h.setBinding(PRODUCTION, "power", 2500);
+    await advance(30);
+    expect(h.state.get("householdPower")).toBe(2200);
+    expect(h.state.get("householdProven")).toBe(true);
+    expect(h.state.get("tankFull")).toBeFalsy();
+
+    // Same production, now all of it exported: the resistor stopped.
+    h.setBinding(METER, "power", -2400);
+    await advance(2); // still inside the 5 min confirmation delay
+    expect(h.state.get("householdPower")).toBe(100);
+    expect(h.state.get("tankFull")).toBeFalsy();
+
+    await advance(4);
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    handle.stop();
+  });
+
+  it("leaves the fallback idle when the heater has its own channel", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({ availableSurplusW: 0 });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, gridEquipment: METER },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.setBinding(METER, "power", 50); // would scream "full" if it were consulted
+    await advance(30);
+
+    expect(h.state.get("householdPower")).toBeNull();
+    expect(h.state.get("householdProven")).toBeFalsy();
+    expect(h.state.get("tankFull")).toBeFalsy();
     handle.stop();
   });
 

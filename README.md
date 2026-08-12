@@ -41,7 +41,24 @@ La recette refuse donc de conclure tant qu'elle n'a pas vu la résistance tirer 
 
 L'asymétrie est voulue : conclure « plein » à tort laisse la maison sans eau chaude, refuser de conclure laisse seulement un relais fermé sur un circuit qui ne consomme rien.
 
-**Conséquence pratique** : la mesure doit porter sur le chauffe-eau lui-même. Un compteur général ne convient pas — après la coupure du thermostat, la consommation résiduelle du logement reste au-dessus de `cutoffPower` et la coupure ne serait jamais vue.
+**Conséquence pratique** : cette mesure-là doit porter sur le chauffe-eau lui-même. Un compteur général ne peut pas servir de `cutoffPower` — après la coupure du thermostat, la consommation résiduelle du logement reste au-dessus du seuil et la coupure ne serait jamais vue.
+
+### À défaut, la consommation totale suffit
+
+Beaucoup d'installations n'ont pas de mesure sur le seul chauffe-eau, mais en ont une sur toute la maison. Renseigner le **compteur général** dans les réglages avancés active un détecteur de repli, qui repose sur une inférence à sens unique :
+
+> quoi qu'il tourne d'autre, **un total inférieur à la puissance déclarée du chauffe-eau prouve que la résistance ne tire pas**.
+
+La réciproque ne dit rien — un total élevé peut être un four — donc ce détecteur ne peut jamais conclure « ça chauffe encore », seulement « ballon plein ». Il ne s'active que faute de canal dédié : une mesure sur le chauffe-eau seul est strictement meilleure et garde la main.
+
+`total = compteur général + production`, le compteur général compté **positif en soutirage** — c'est la convention du cœur lui-même, l'arbitre lisant `exportW = -signedGridW`. La recette ne redemande donc pas un signe qu'elle ne ferait que mal deviner.
+
+Deux garde-fous, dans le même esprit que `powerProven` :
+
+- **le compteur doit d'abord prouver qu'il voit le chauffe-eau** — tant que le total n'a pas atteint 90 % de la puissance déclarée relais fermé, aucune conclusion. Un sous-compteur qui ne couvre pas le ballon lit bas en permanence et déclarerait « plein » à chaque cycle ; là, il ne déclare rien ;
+- **sous photovoltaïque, le compteur général seul ne suffit pas** — 2,2 kW couverts par les panneaux se lisent ~0 W au réseau, exactement comme un ballon qui vient de se remplir. Si le compteur de production n'est pas renseigné, le détecteur se met en retrait dès que l'arbitre annonce du surplus, et le dit dans le journal. Renseigner les deux compteurs le rend opérant toute la journée.
+
+Une fois le ballon déclaré plein, la suite est celle du canal dédié : le relais s'ouvre et la réservation auprès de l'arbitre est relâchée dans le même tick, pour ne pas rester assis sur des watts que la charge suivante attend.
 
 ## Les heures creuses viennent de Sowel, et de nulle part ailleurs
 

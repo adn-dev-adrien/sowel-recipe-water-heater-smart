@@ -2,7 +2,7 @@
   "id": "water-heater-smart",
   "type": "recipe",
   "name": "Smart Water Heater",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Drives an on/off water heater: hot-water floor, off-peak night cycle placed just before the window ends, and solar-surplus heating arbitrated by Sowel. Detects the tank thermostat cut-off from the power draw.",
   "icon": "Droplets",
   "repo": "adn-dev-adrien/sowel-recipe-water-heater-smart",

@@ -299,6 +299,31 @@ const DRAW_OFF_DELTA_C = 3;
  */
 const CUTOFF_MIN_PEAK_RATIO = 0.5;
 
+/**
+ * Fallback cut-off detection, for the very common install where the heater has
+ * no meter of its own but the house does.
+ *
+ * The inference is one-sided and needs no per-load channel: whatever else is
+ * running, a household total below the heater's declared power proves the
+ * heater is not pulling it. The converse says nothing — a high total may be an
+ * oven — which is why this can only ever conclude "full", never "still going".
+ *
+ * `household = grid + production`, with grid signed positive on import. That is
+ * core's own convention (the arbiter reads `exportW = -signedGridW`), so the
+ * recipe does not re-ask the user for a sign it would only get wrong.
+ *
+ * Two ratios rather than one, because the declared power is a user-typed number
+ * and a 2200 W plate can hide an 1800 W element:
+ *  - PROVEN — the total must have been seen this high with the relay closed
+ *    before any conclusion is drawn. A "main meter" that does not actually
+ *    cover the heater never reaches it, and the detector stays silent instead
+ *    of declaring a full tank on every cycle.
+ *  - CUTOFF — below this, sustained for `cutoffDelay`, the resistor is off.
+ * PROVEN sits above CUTOFF on purpose: the gap is the hysteresis.
+ */
+const HOUSEHOLD_PROVEN_RATIO = 0.9;
+const HOUSEHOLD_CUTOFF_RATIO = 0.8;
+
 /** Relay protection: never cycle faster than this. */
 const MIN_ON_MS = 5 * 60 * 1000;
 const MIN_OFF_MS = 10 * 60 * 1000;
@@ -326,6 +351,13 @@ const LEARN_GROWTH_MIN = 45;
 const LEARN_ALPHA = 0.4;
 
 const HEATER_TYPES = ["water_heater", "switch"];
+
+/** Meters read only to infer the cut-off; never to decide when to heat. */
+const GRID_TYPES = ["main_energy_meter"];
+const PRODUCTION_TYPES = ["energy_production_meter"];
+
+/** Aliases a meter equipment may carry its instantaneous power under. */
+const POWER_ALIASES = ["power", "power_a", "power_total"];
 
 /**
  * Grid the recipe accepts to buy, as a fraction of the heater's rating, when
@@ -676,6 +708,24 @@ function buildSlots(): RecipeSlotDef[] {
       group: "advanced",
     },
     {
+      id: "gridEquipment",
+      name: "House meter",
+      description: "Cut-off fallback",
+      type: "equipment",
+      required: false,
+      constraints: { equipmentType: GRID_TYPES, crossZone: true },
+      group: "cutoff",
+    },
+    {
+      id: "productionEquipment",
+      name: "PV meter",
+      description: "Required if solar",
+      type: "equipment",
+      required: false,
+      constraints: { equipmentType: PRODUCTION_TYPES, crossZone: true },
+      group: "cutoff",
+    },
+    {
       id: "maxCycle",
       name: "Longest run",
       description: "Safety cap",
@@ -755,6 +805,14 @@ const FR: RecipeLangPack = {
       name: "D\u00e9lai coupure",
       description: "Avant de conclure",
     },
+    gridEquipment: {
+      name: "Compteur g\u00e9n\u00e9ral",
+      description: "Repli d\u00e9tection coupure",
+    },
+    productionEquipment: {
+      name: "Compteur production",
+      description: "Obligatoire si solaire",
+    },
     maxCycle: {
       name: "Chauffe maxi",
       description: "Garde-fou",
@@ -764,6 +822,7 @@ const FR: RecipeLangPack = {
     main: "\u00c9quipement",
     floor: "Chauffe de secours (plus d'eau chaude)",
     hc: "Heures creuses",
+    cutoff: "D\u00e9tection de coupure sans mesure d\u00e9di\u00e9e",
     advanced: "R\u00e9glages avanc\u00e9s",
   },
 };
@@ -859,6 +918,9 @@ export function createRecipe(): RecipeDefinition {
       const heaterId = String(params.heater);
       const tempOverride = String(params.tempKey ?? "").trim();
       const powerOverride = String(params.powerKey ?? "").trim();
+      /** Cut-off fallback only — nothing here decides when to heat. */
+      const gridId = params.gridEquipment ? String(params.gridEquipment) : null;
+      const productionId = params.productionEquipment ? String(params.productionEquipment) : null;
 
       function tempAlias(): string | null {
         const eq = heaterEq();
@@ -928,6 +990,9 @@ export function createRecipe(): RecipeDefinition {
       let cyclePeakPower = 0;
       /** Persisted: the power channel has been seen carrying the heater's draw. */
       let powerProven = false;
+      /** Same idea for the household total, when it is the only witness. */
+      let householdLowSince: number | null = null;
+      let householdProven = false;
       let mismatchSince: number | null = null;
       let manualOn = false;
 
@@ -993,6 +1058,15 @@ export function createRecipe(): RecipeDefinition {
         }
         const c = eq.computedData?.find((d) => d.alias === alias);
         return c ? toNumber(c.value) : null;
+      }
+
+      /** First alias that yields a live number — meters do not agree on naming. */
+      function readFirstNumeric(eq: EquipmentLite | null, aliases: string[]): number | null {
+        for (const alias of aliases) {
+          const v = readNumeric(eq, alias);
+          if (v !== null) return v;
+        }
+        return null;
       }
 
       /** Actual relay state as reported by the device, or null when unknown. */
@@ -1255,8 +1329,48 @@ export function createRecipe(): RecipeDefinition {
         nowMin: number;
         temp: number | null;
         power: number | null;
+        /** Household draw, or null when it cannot be established honestly. */
+        household: number | null;
         inHc: boolean;
         inHcHeat: boolean;
+      }
+
+      /**
+       * Household draw, or null when it cannot be established honestly.
+       *
+       * Null on a missing/stale grid reading, and — the case that matters — null
+       * whenever the sun is up but no production meter is bound. Grid alone is
+       * not the household total under PV: 2.2 kW of resistor covered by the
+       * panels shows as ~0 W at the grid, which reads exactly like a tank that
+       * just filled. Rather than guess, the detector stands down for the day.
+       * The arbiter's surplus is the tell-tale, and it is already on hand.
+       */
+      function householdPowerW(): number | null {
+        if (!gridId) return null;
+        const grid = readFirstNumeric(
+          ctx.equipmentManager.getByIdWithDetails(gridId),
+          POWER_ALIASES,
+        );
+        if (grid === null) return null;
+
+        if (productionId) {
+          const prod = readFirstNumeric(
+            ctx.equipmentManager.getByIdWithDetails(productionId),
+            POWER_ALIASES,
+          );
+          if (prod === null) return null;
+          return grid + Math.max(0, prod);
+        }
+
+        const surplus = readCapacityState()?.availableSurplusW ?? null;
+        if (surplus !== null && surplus > 0) {
+          warnOnce(
+            "household-needs-pv",
+            "Détection de coupure suspendue tant que le soleil produit : renseigne le compteur de production dans les réglages avancés, le compteur général seul ne donne pas la consommation totale sous photovoltaïque",
+          );
+          return null;
+        }
+        return grid;
       }
 
       function snapshot(date: Date): Snapshot {
@@ -1290,6 +1404,7 @@ export function createRecipe(): RecipeDefinition {
           nowMin: nMin,
           temp,
           power,
+          household: power === null && relayOn ? householdPowerW() : null,
           inHc: hcWindow !== null && isWithinWindow(nMin, hcWindow.startMin, hcWindow.endMin),
           inHcHeat: heat !== null && isWithinWindow(nMin, heat.startMin, heat.endMin),
         };
@@ -1578,13 +1693,59 @@ export function createRecipe(): RecipeDefinition {
        * to heating levels is measuring something other than this heater, and
        * concluding "full" from it would wedge the recipe into doing nothing.
        */
+      /**
+       * Cut-off inferred from the household total, for a heater with no meter
+       * of its own. Only ever concludes "full": a total below the declared
+       * power proves the resistor is off, a high one proves nothing.
+       *
+       * Runs only as a fallback. A dedicated channel measures this heater and
+       * nothing else, so wherever one exists it wins and this stays idle.
+       */
+      function detectCutoffFromHousehold(s: Snapshot): void {
+        if (s.household === null) return;
+
+        const declared = heaterPower();
+        if (s.household >= declared * HOUSEHOLD_PROVEN_RATIO && !householdProven) {
+          householdProven = true;
+          ctx.state.set("householdProven", true);
+          ctx.log(
+            `Consommation totale validée comme témoin — ${Math.round(s.household)} W observés, relais fermé`,
+          );
+        }
+        if (s.now - onSince! < STARTUP_GRACE_MS) return;
+        if (!householdProven) {
+          householdLowSince = null;
+          return;
+        }
+
+        if (s.household >= declared * HOUSEHOLD_CUTOFF_RATIO) {
+          householdLowSince = null;
+          return;
+        }
+        householdLowSince ??= s.now;
+        if (s.now - householdLowSince >= cutoffDelayMs) {
+          const collapsedAt = householdLowSince;
+          householdLowSince = null;
+          ctx.log(
+            `Ballon plein déduit de la consommation totale (${Math.round(
+              s.household,
+            )} W < ${declared} W déclarés, relais fermé)`,
+          );
+          markTankFull(s.temp, s.now, collapsedAt);
+        }
+      }
+
       function detectCutoff(s: Snapshot): void {
         if (!relayOn || onSince === null) {
           lowPowerSince = null;
+          householdLowSince = null;
           cyclePeakPower = 0;
           return;
         }
-        if (s.power === null) return;
+        if (s.power === null) {
+          detectCutoffFromHousehold(s);
+          return;
+        }
         if (s.power > cyclePeakPower) cyclePeakPower = s.power;
         if (!powerProven && cyclePeakPower >= heaterPower() * CUTOFF_MIN_PEAK_RATIO) {
           powerProven = true;
@@ -1660,10 +1821,12 @@ export function createRecipe(): RecipeDefinition {
         );
         ctx.state.set("mode", mode);
         ctx.state.set("powerProven", powerProven);
+        ctx.state.set("householdProven", householdProven);
       }
 
       function publish(s: Snapshot): void {
         const heat = hcHeatWindow(s.now);
+        ctx.state.set("householdPower", s.household);
         ctx.state.set("status", relayOn ? "heating" : manualOn ? "manual" : "off");
         ctx.state.set("reason", reason);
         ctx.state.set("mode", mode);
@@ -1737,6 +1900,7 @@ export function createRecipe(): RecipeDefinition {
               );
 
         powerProven = ctx.state.get("powerProven") === true;
+        householdProven = ctx.state.get("householdProven") === true;
 
         const storedMode = ctx.state.get("mode");
         mode = storedMode === "boost" || storedMode === "off" ? storedMode : "auto";
@@ -1772,7 +1936,11 @@ export function createRecipe(): RecipeDefinition {
         tempAlias() ? `sonde ${tempAlias()}` : "sans sonde (chauffe de secours désactivée)",
         powerAlias()
           ? `puissance ${powerAlias()}`
-          : "sans mesure de puissance (détection de coupure désactivée)",
+          : gridId
+            ? `coupure déduite de la consommation totale (${nameOf(gridId)}${
+                productionId ? ` + ${nameOf(productionId)}` : ", sans compteur de production"
+              })`
+            : "sans mesure de puissance (détection de coupure désactivée)",
         !ctx.helpers.energy
           ? "sans arbitrage du surplus (Sowel 1.39 minimum)"
           : !profile
@@ -1794,10 +1962,10 @@ export function createRecipe(): RecipeDefinition {
           "Aucune sonde de température trouvée sur le chauffe-eau : la chauffe de secours est inactive, la recette ne fera que les heures creuses et le solaire",
         );
       }
-      if (!powerAlias()) {
+      if (!powerAlias() && !gridId) {
         warnOnce(
           "no-power",
-          "Aucune mesure de puissance : impossible de détecter la coupure du thermostat, les cycles seront bornés par la plage horaire et la durée maximale",
+          "Aucune mesure de puissance : impossible de détecter la coupure du thermostat, les cycles seront bornés par la plage horaire et la durée maximale. Un compteur général renseigné dans les réglages avancés suffirait à la déduire.",
         );
       }
 

@@ -1351,14 +1351,31 @@ export function createRecipe(): RecipeDefinition {
           ctx.equipmentManager.getByIdWithDetails(gridId),
           POWER_ALIASES,
         );
-        if (grid === null) return null;
+        // A meter that reads nothing is the one failure that looks exactly like
+        // silence from the detector. Name it, or "the relay stays closed on a
+        // full tank" has no explanation anywhere in the journal.
+        if (grid === null) {
+          warnOnce(
+            "household-grid-mute",
+            `Compteur général « ${nameOf(gridId)} » : aucune puissance lisible (alias attendu parmi ${POWER_ALIASES.join(", ")}) — coupure du thermostat indétectable`,
+          );
+          return null;
+        }
+        warned.delete("household-grid-mute");
 
         if (productionId) {
           const prod = readFirstNumeric(
             ctx.equipmentManager.getByIdWithDetails(productionId),
             POWER_ALIASES,
           );
-          if (prod === null) return null;
+          if (prod === null) {
+            warnOnce(
+              "household-prod-mute",
+              `Compteur de production « ${nameOf(productionId)} » : aucune puissance lisible (alias attendu parmi ${POWER_ALIASES.join(", ")}) — coupure du thermostat indétectable`,
+            );
+            return null;
+          }
+          warned.delete("household-prod-mute");
           return grid + Math.max(0, prod);
         }
 
@@ -1581,6 +1598,7 @@ export function createRecipe(): RecipeDefinition {
           onSince = s.now;
           cycleStartedAt = s.now;
           lowPowerSince = null;
+          householdLowSince = null;
           cyclePeakPower = 0;
           ctx.log(`Chauffe démarrée (${REASON_FR[desired]})`);
           return;

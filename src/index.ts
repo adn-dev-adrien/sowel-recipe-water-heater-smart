@@ -489,6 +489,12 @@ export interface TankModel {
   fullC: number;
   /** Wh removed per °C of probe collapse during a draw. Fitted nightly. */
   drawWhPerC: number;
+  /**
+   * False until the first thermostat cut-off. Before that the balance has no
+   * origin, so every figure derived from it is meaningless — and "0 %" on a
+   * hot tank is worse than no number at all. The UI says so instead.
+   */
+  anchored: boolean;
 }
 
 /** 1 litre raised by 1 K = 4186 J = 1.163 Wh. */
@@ -551,8 +557,8 @@ export function anchorOnCutoff(
   probeC: number | null,
 ): TankModel {
   const fullC = probeC !== null && probeC > model.coldC ? probeC : model.fullC;
-  const anchored: TankModel = { ...model, fullC };
-  return { ...anchored, storedWh: tankCapacityWh(volumeL, anchored) };
+  const next: TankModel = { ...model, fullC, anchored: true };
+  return { ...next, storedWh: tankCapacityWh(volumeL, next) };
 }
 
 /** The coldest reading ever seen is the inlet temperature, learned for free. */
@@ -1171,6 +1177,7 @@ export function createRecipe(): RecipeDefinition {
         coldC: 20,
         fullC: 60,
         drawWhPerC: DEFAULT_DRAW_WH_PER_C,
+        anchored: false,
       };
       /** Probe reading at the previous tick — draws are read from its drops. */
       let lastProbeC: number | null = null;
@@ -2101,11 +2108,26 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("modelColdC", round1(tank.coldC));
         ctx.state.set("modelFullC", round1(tank.fullC));
         ctx.state.set("modelDrawWhPerC", tank.drawWhPerC);
+        ctx.state.set("modelAnchored", tank.anchored);
         ctx.state.set("tankMeanTemp", round1(modelMeanC(tankVolumeL, tank)));
         ctx.state.set("tankHotLitres", round1(modelHotLitres(tankVolumeL, tank)));
+        const charge =
+          tank.anchored && capacityWh > 0
+            ? Math.round((tank.storedWh / capacityWh) * 100)
+            : null;
+        ctx.state.set("tankCharge", charge);
+
+        // The card's one free line (state.summary). It is the only place the
+        // observer is visible without an API call, so it carries the model and
+        // the probe side by side — the whole point being that they disagree.
+        const meanC = modelMeanC(tankVolumeL, tank);
+        const litres = modelHotLitres(tankVolumeL, tank);
         ctx.state.set(
-          "tankCharge",
-          capacityWh > 0 ? Math.round((tank.storedWh / capacityWh) * 100) : null,
+          "summary",
+          charge === null || meanC === null || litres === null
+            ? "Modèle de charge : en attente du premier ancrage"
+            : `Charge ${charge} % · ${Math.round(litres)} L · modèle ${meanC.toFixed(0)} °C` +
+              (s.temp !== null ? ` / sonde ${s.temp.toFixed(0)} °C` : ""),
         );
         ctx.state.set("status", relayOn ? "heating" : manualOn ? "manual" : "off");
         ctx.state.set("reason", reason);
@@ -2186,6 +2208,7 @@ export function createRecipe(): RecipeDefinition {
           coldC: num("modelColdC") ?? 20,
           fullC: num("modelFullC") ?? 60,
           drawWhPerC: num("modelDrawWhPerC") ?? DEFAULT_DRAW_WH_PER_C,
+          anchored: ctx.state.get("modelAnchored") === true,
         };
 
         const storedMode = ctx.state.get("mode");

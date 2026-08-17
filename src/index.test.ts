@@ -492,7 +492,7 @@ describe("findOnOffOrderAlias", () => {
 // ============================================================
 
 describe("tank model", () => {
-  const base = () => ({ storedWh: 0, coldC: 23, fullC: 63, drawWhPerC: 120 });
+  const base = () => ({ storedWh: 0, coldC: 23, fullC: 63, drawWhPerC: 120, anchored: false });
 
   it("prices the tank from its volume and learned span", () => {
     // 280 L raised 40 K = 280 * 1.163 * 40 = 13 026 Wh, the figure the night
@@ -1157,7 +1157,9 @@ describe("createInstance", () => {
     // 2200 W in, 70 W of standing loss out, over ~1 h.
     expect(h.state.get("modelStoredWh")).toBeGreaterThan(1900);
     expect(h.state.get("modelStoredWh")).toBeLessThan(2300);
-    expect(h.state.get("tankCharge")).toBeLessThan(30); // nowhere near full
+    // No anchor yet, so no percentage is offered: "0 %" on a hot tank would be
+    // worse than saying nothing.
+    expect(h.state.get("tankCharge")).toBeNull();
 
     h.setBinding(HEATER, "power", 4); // thermostat opens
     await advance(6); // > 5 min cut-off delay
@@ -1166,6 +1168,29 @@ describe("createInstance", () => {
     // The anchor: drift discarded, and the probe retrains the full temperature.
     expect(h.state.get("tankCharge")).toBe(100);
     expect(h.state.get("modelFullC")).toBe(45); // the harness probe reading
+    handle.stop();
+  });
+
+  it("puts the model and the probe side by side on the card", async () => {
+    // state.summary is the only place the observer shows without an API call.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("summary")).toContain("en attente du premier ancrage");
+
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(30);
+    h.setBinding(HEATER, "power", 4);
+    await advance(6); // thermostat cut-off → anchor
+
+    const summary = h.state.get("summary") as string;
+    expect(summary).toContain("Charge 100 %");
+    expect(summary).toContain("modèle 60 °C");
+    expect(summary).toContain("sonde 60 °C");
     handle.stop();
   });
 

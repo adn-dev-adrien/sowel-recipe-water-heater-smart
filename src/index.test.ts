@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
+  tankCapacityWh,
+  modelMeanC,
+  modelHotLitres,
+  applyEnergy,
+  anchorOnCutoff,
+  learnColdInlet,
+  calibrateDrawCoefficient,
   createRecipe,
   resolveBindingAlias,
   computeHcHeatWindow,
@@ -479,6 +486,62 @@ describe("findOnOffOrderAlias", () => {
 // ============================================================
 // validate()
 // ============================================================
+
+// ============================================================
+// Tank charge observer
+// ============================================================
+
+describe("tank model", () => {
+  const base = () => ({ storedWh: 0, coldC: 23, fullC: 63, drawWhPerC: 120 });
+
+  it("prices the tank from its volume and learned span", () => {
+    // 280 L raised 40 K = 280 * 1.163 * 40 = 13 026 Wh, the figure the night
+    // cycles corroborate (149 min at 2.43 kW on a 46 %-drained tank).
+    expect(Math.round(tankCapacityWh(280, base()))).toBe(13026);
+  });
+
+  it("reports the mean the probe cannot give", () => {
+    const m = { ...base(), storedWh: 6513 }; // half charge
+    expect(Math.round(modelMeanC(280, m) ?? 0)).toBe(43);
+    expect(Math.round(modelHotLitres(280, m) ?? 0)).toBe(140);
+  });
+
+  it("clamps energy at empty and at full", () => {
+    const cap = tankCapacityWh(280, base());
+    expect(applyEnergy(base(), cap, -5000).storedWh).toBe(0);
+    expect(applyEnergy({ ...base(), storedWh: cap }, cap, 5000).storedWh).toBe(cap);
+  });
+
+  it("anchors on the thermostat and retrains the full temperature", () => {
+    const m = anchorOnCutoff({ ...base(), storedWh: 1000 }, 280, 61.5);
+    expect(m.fullC).toBe(61.5);
+    expect(m.storedWh).toBe(tankCapacityWh(280, m)); // drift discarded
+  });
+
+  it("learns the cold inlet from the coldest reading ever seen", () => {
+    expect(learnColdInlet(base(), 21.4).coldC).toBe(21.4);
+    expect(learnColdInlet(base(), 30).coldC).toBe(23); // never upwards
+  });
+
+  it("raises the draw coefficient when the night had more to put back", () => {
+    // Model thought 3000 Wh missing; the cycle actually delivered 6000. The
+    // draws were sized at half their true cost.
+    const cap = tankCapacityWh(280, base());
+    expect(calibrateDrawCoefficient(120, 6000, 3000, cap)).toBe(156); // 120*(0.7+0.3*2)
+  });
+
+  it("refuses to learn from a top-up on a nearly full tank", () => {
+    // Both numbers small: their ratio is noise, not evidence.
+    const cap = tankCapacityWh(280, base());
+    expect(calibrateDrawCoefficient(120, 300, 200, cap)).toBe(120);
+  });
+
+  it("never lets one night drive the coefficient out of bounds", () => {
+    const cap = tankCapacityWh(280, base());
+    expect(calibrateDrawCoefficient(500, 13000, 1400, cap)).toBeLessThanOrEqual(600);
+    expect(calibrateDrawCoefficient(25, 1400, 13000, cap)).toBeGreaterThanOrEqual(20);
+  });
+});
 
 describe("validate", () => {
   it("accepts a well-formed configuration", () => {

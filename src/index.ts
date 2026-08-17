@@ -451,6 +451,132 @@ export function learnEstimate(
   return Math.max(15, Math.min(Math.round(next), maxMin));
 }
 
+// ============================================================
+// Tank charge observer
+// ============================================================
+
+/**
+ * What the bottom probe cannot say, and how the recipe says it anyway.
+ *
+ * A probe sitting low in the tank, in the thermostat's own orifice, reads the
+ * coldest water there is. During a draw it collapses in minutes while most of
+ * the tank is still hot; measured against the energy the following night had
+ * to put back, the gap between what it reads and the tank's mean runs to
+ * 25–30 °C. Any threshold placed on the raw reading is therefore a threshold on
+ * the wrong quantity.
+ *
+ * So the state tracked here is **energy**, not temperature — the mean falls out
+ * of it — and the probe is used only for the two things it does report
+ * faithfully: that a draw is happening, and how hot the tank is at the one
+ * instant it is uniform.
+ *
+ * The model is never trusted for long. The thermostat's own cut-off is a free
+ * anchor: when it opens, the whole tank has reached its setpoint, so stored
+ * energy IS capacity and the accumulated error is discarded. That happens most
+ * nights, which bounds drift to roughly a day.
+ *
+ * `drawWhPerC` is the one coefficient nothing measures directly. It is fitted,
+ * not chosen: the duration of each anchoring cycle reveals the deficit the
+ * model should have predicted, and the ratio corrects it. See
+ * `calibrateDrawCoefficient`.
+ */
+export interface TankModel {
+  /** Energy stored above the cold-inlet reference, Wh. */
+  storedWh: number;
+  /** Coldest reading ever seen — the cold-water inlet, learned. */
+  coldC: number;
+  /** Reading at the last thermostat cut-off — the tank's full temperature. */
+  fullC: number;
+  /** Wh removed per °C of probe collapse during a draw. Fitted nightly. */
+  drawWhPerC: number;
+}
+
+/** 1 litre raised by 1 K = 4186 J = 1.163 Wh. */
+const WH_PER_LITRE_KELVIN = 1.163;
+
+/** Starting guess for `drawWhPerC`, replaced by the first calibration. */
+export const DEFAULT_DRAW_WH_PER_C = 120;
+
+/** Bounds on the fitted coefficient — a bad night must not wreck the model. */
+const DRAW_COEFF_MIN = 20;
+const DRAW_COEFF_MAX = 600;
+/** Correction is smoothed: one cycle is evidence, not proof. */
+const DRAW_COEFF_ALPHA = 0.3;
+
+/** Energy a full tank holds above the cold inlet, Wh. */
+export function tankCapacityWh(volumeL: number, model: TankModel): number {
+  return Math.max(0, volumeL * WH_PER_LITRE_KELVIN * (model.fullC - model.coldC));
+}
+
+/** Modelled mean temperature — the number the probe cannot give directly. */
+export function modelMeanC(volumeL: number, model: TankModel): number | null {
+  if (volumeL <= 0) return null;
+  return model.coldC + model.storedWh / (volumeL * WH_PER_LITRE_KELVIN);
+}
+
+/** Stored energy expressed as litres at the tank's full temperature. */
+export function modelHotLitres(volumeL: number, model: TankModel): number | null {
+  const span = model.fullC - model.coldC;
+  if (span <= 0) return null;
+  return model.storedWh / (WH_PER_LITRE_KELVIN * span);
+}
+
+/** Heating, standing loss and draws, all in Wh, clamped to [0, capacity]. */
+export function applyEnergy(
+  model: TankModel,
+  capacityWh: number,
+  deltaWh: number,
+): TankModel {
+  const stored = Math.max(0, Math.min(capacityWh, model.storedWh + deltaWh));
+  return { ...model, storedWh: stored };
+}
+
+/**
+ * The free anchor: the thermostat opened, so the tank is uniformly at its
+ * setpoint. Stored energy is capacity by definition and the drift is dropped.
+ * The reading also *is* the full temperature, so it retrains `fullC`.
+ */
+export function anchorOnCutoff(
+  model: TankModel,
+  volumeL: number,
+  probeC: number | null,
+): TankModel {
+  const fullC = probeC !== null && probeC > model.coldC ? probeC : model.fullC;
+  const anchored: TankModel = { ...model, fullC };
+  return { ...anchored, storedWh: tankCapacityWh(volumeL, anchored) };
+}
+
+/** The coldest reading ever seen is the inlet temperature, learned for free. */
+export function learnColdInlet(model: TankModel, probeC: number | null): TankModel {
+  if (probeC === null || probeC >= model.coldC) return model;
+  return { ...model, coldC: probeC };
+}
+
+/**
+ * Fit `drawWhPerC` from a cycle that ended on the thermostat.
+ *
+ * The cycle delivered `deliveredWh` and finished full, so the tank really was
+ * `deliveredWh` short when it started. The model thought it was
+ * `predictedDeficitWh` short, and the difference is almost entirely the draws
+ * it mis-sized. Scaling by the ratio therefore corrects the coefficient — but
+ * only a share of the way, and never outside its bounds.
+ *
+ * Cycles too short to be informative are refused: on a nearly full tank both
+ * numbers are small and their ratio is noise.
+ */
+export function calibrateDrawCoefficient(
+  current: number,
+  deliveredWh: number,
+  predictedDeficitWh: number,
+  capacityWh: number,
+): number {
+  if (deliveredWh < capacityWh * 0.1) return current;
+  if (predictedDeficitWh < capacityWh * 0.05) return current;
+  const ratio = deliveredWh / predictedDeficitWh;
+  const next = current * (1 - DRAW_COEFF_ALPHA) + current * ratio * DRAW_COEFF_ALPHA;
+  return Math.round(Math.max(DRAW_COEFF_MIN, Math.min(DRAW_COEFF_MAX, next)));
+}
+
 /**
  * Pick the night window out of the instance's configured off-peak slots.
  *

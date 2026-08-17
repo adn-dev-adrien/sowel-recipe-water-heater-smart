@@ -60,6 +60,31 @@ Deux garde-fous, dans le même esprit que `powerProven` :
 
 Une fois le ballon déclaré plein, la suite est celle du canal dédié : le relais s'ouvre et la réservation auprès de l'arbitre est relâchée dans le même tick, pour ne pas rester assis sur des watts que la charge suivante attend.
 
+## Le modèle de charge du ballon
+
+La sonde est en bas, dans l'orifice du thermostat : elle lit l'eau la plus froide du ballon. Neuf jours de relevés confrontés à l'énergie que chaque nuit a dû restituer chiffrent l'écart avec la moyenne du ballon à **25–30 °C** — à 01:00, sonde à 24–33 °C, il restait 151 à 218 L d'eau chaude. Tout seuil posé sur la mesure brute est un seuil sur la mauvaise grandeur.
+
+L'état suivi est donc **l'énergie stockée**, la température moyenne s'en déduisant. La sonde ne sert plus qu'à ce qu'elle rapporte fidèlement : qu'un puisage a lieu, et la température du ballon à l'unique instant où il est homogène.
+
+| Événement | Effet | Origine du coefficient |
+| --- | --- | --- |
+| Coupure du thermostat | `stock := capacité` — **la dérive est jetée** | ancrage gratuit, presque chaque nuit |
+| Chauffe | `+ P·Δt` | temps de relais × puissance déclarée |
+| Pertes statiques | `− standbyPower` | mesurable : −0,22 °C/h sur un ballon au repos |
+| Puisage | `− drawWhPerC × chute` | **ajusté sur l'ancrage** |
+
+Trois choses en font un observateur et non une devinette :
+
+- **l'ancrage** — quand le thermostat s'ouvre, le ballon est à sa consigne, donc le stock *est* la capacité. L'erreur accumulée est abandonnée, ce qui borne la dérive à environ une journée ;
+- **l'eau froide d'arrivée** apprise du minimum jamais relevé ;
+- **`drawWhPerC`**, seul coefficient que rien ne mesure, ajusté par la durée du cycle d'ancrage : elle révèle le déficit que le modèle aurait dû prédire. Correction lissée, bornée, et refusée sur les cycles trop courts où le rapport n'est que du bruit.
+
+Un puisage se lit à la **vitesse** de chute de la sonde, pas à sa valeur : une douche la fait tomber de 1,6 à 4,0 °C entre deux relevés, le refroidissement statique de 0,22 °C par heure. La séparation est assez large pour ne pas être un réglage.
+
+L'état de l'instance publie `tankCharge` (%), `tankMeanTemp`, `tankHotLitres`, et les internes `modelStoredWh` / `modelColdC` / `modelFullC` / `modelDrawWhPerC`.
+
+**L'observateur ne décide de rien.** Il ne touche pas au relais et n'entre dans aucune condition de chauffe. Il doit d'abord être jugé sur pièce : un seuil de déclenchement posé avant qu'on ait vu le modèle tourner face au confort réel serait aussi arbitraire que celui qu'il remplace.
+
 ## Les heures creuses viennent de Sowel, et de nulle part ailleurs
 
 La recette **ne propose aucun champ d'horaires**. Les heures creuses sont saisies une fois dans la carte **« Tarifs énergie »** des Réglages, et lues à chaque évaluation via `ctx.helpers.getTariff()` (Sowel ≥ 1.36, spec 138).

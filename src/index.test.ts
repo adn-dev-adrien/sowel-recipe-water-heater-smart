@@ -1143,6 +1143,61 @@ describe("createInstance", () => {
     handle.stop();
   });
 
+  it("tracks the charge through a cycle and anchors it on the thermostat", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    await advance(60); // one hour of real heating
+    // 2200 W in, 70 W of standing loss out, over ~1 h.
+    expect(h.state.get("modelStoredWh")).toBeGreaterThan(1900);
+    expect(h.state.get("modelStoredWh")).toBeLessThan(2300);
+    expect(h.state.get("tankCharge")).toBeLessThan(30); // nowhere near full
+
+    h.setBinding(HEATER, "power", 4); // thermostat opens
+    await advance(6); // > 5 min cut-off delay
+
+    expect(h.state.get("tankFull")).toBe(true);
+    // The anchor: drift discarded, and the probe retrains the full temperature.
+    expect(h.state.get("tankCharge")).toBe(100);
+    expect(h.state.get("modelFullC")).toBe(45); // the harness probe reading
+    handle.stop();
+  });
+
+  it("reads a probe collapse as a draw, and slow cooling as no draw", async () => {
+    at("2026-08-10T03:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70 },
+      h.ctx as never,
+    );
+    // Charge the model the only way it can be charged: relay time, ended on
+    // the thermostat so the anchor sets a known full state.
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(30);
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+    expect(h.state.get("tankCharge")).toBe(100);
+    const full = h.state.get("modelStoredWh") as number;
+
+    h.setBinding(HEATER, "water_temperature", 59.5); // 0.5 °C: cooling
+    await advance(2);
+    const afterCooling = h.state.get("modelStoredWh") as number;
+    expect(full - afterCooling).toBeLessThan(200); // standby only
+
+    h.setBinding(HEATER, "water_temperature", 45); // 14.5 °C: a shower
+    await advance(2);
+    const afterDraw = h.state.get("modelStoredWh") as number;
+    expect(afterCooling - afterDraw).toBeGreaterThan(1000);
+    handle.stop();
+  });
+
   it("ignores the power reading during the start-up grace period", async () => {
     at("2026-08-10T03:00:00");
     const h = buildHarness({ drawWhenOn: 0 });

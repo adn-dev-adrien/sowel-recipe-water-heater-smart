@@ -494,6 +494,15 @@ export interface TankModel {
 /** 1 litre raised by 1 K = 4186 J = 1.163 Wh. */
 const WH_PER_LITRE_KELVIN = 1.163;
 
+/**
+ * Probe fall between two samples that means a draw rather than cooling.
+ *
+ * The separation is wide enough not to be a tuning knob: measured showers move
+ * the probe 1.6–4.0 °C between samples, standing loss moves it 0.22 °C per
+ * hour. Anything gentler is the tank cooling, and the standby term has it.
+ */
+const DRAW_TICK_DROP_C = 1;
+
 /** Starting guess for `drawWhPerC`, replaced by the first calibration. */
 export const DEFAULT_DRAW_WH_PER_C = 120;
 
@@ -649,6 +658,11 @@ export function computeSlack(input: {
   if (input.needsFullCycle) return "none";
   if (input.tankFull) return "high";
   return "some";
+}
+
+/** One decimal, or null — the state is read by humans. */
+function round1(v: number | null): number | null {
+  return v === null ? null : Math.round(v * 10) / 10;
 }
 
 function toNumber(value: unknown): number | null {
@@ -852,6 +866,26 @@ function buildSlots(): RecipeSlotDef[] {
       group: "cutoff",
     },
     {
+      id: "tankVolume",
+      name: "Tank volume (L)",
+      description: "Sizes the model",
+      type: "number",
+      required: false,
+      defaultValue: 200,
+      constraints: { min: 30, max: 1000 },
+      group: "tank",
+    },
+    {
+      id: "standbyPower",
+      name: "Standing loss (W)",
+      description: "Measured, not rated",
+      type: "number",
+      required: false,
+      defaultValue: 70,
+      constraints: { min: 0, max: 500 },
+      group: "tank",
+    },
+    {
       id: "maxCycle",
       name: "Longest run",
       description: "Safety cap",
@@ -939,6 +973,14 @@ const FR: RecipeLangPack = {
       name: "Compteur production",
       description: "Obligatoire si solaire",
     },
+    tankVolume: {
+      name: "Volume du ballon (L)",
+      description: "Dimensionne le modèle",
+    },
+    standbyPower: {
+      name: "Pertes statiques (W)",
+      description: "Mesurées, pas la plaque",
+    },
     maxCycle: {
       name: "Chauffe maxi",
       description: "Garde-fou",
@@ -948,6 +990,7 @@ const FR: RecipeLangPack = {
     main: "\u00c9quipement",
     floor: "Chauffe de secours (plus d'eau chaude)",
     hc: "Heures creuses",
+    tank: "Mod\u00e8le de charge du ballon",
     cutoff: "D\u00e9tection de coupure sans mesure d\u00e9di\u00e9e",
     advanced: "R\u00e9glages avanc\u00e9s",
   },
@@ -1089,6 +1132,8 @@ export function createRecipe(): RecipeDefinition {
         : "late";
       const fullCycleEveryDays = toNumber(params.fullCycleEveryDays) ?? 7;
 
+      const tankVolumeL = toNumber(params.tankVolume) ?? 200;
+      const standbyW = toNumber(params.standbyPower) ?? 70;
       const cutoffPower = toNumber(params.cutoffPower) ?? 300;
       const cutoffDelayMs = ctx.helpers.parseDuration(params.cutoffDelay ?? "5m");
       const maxCycleMs = ctx.helpers.parseDuration(params.maxCycle ?? "6h");
@@ -1119,6 +1164,20 @@ export function createRecipe(): RecipeDefinition {
       /** Same idea for the household total, when it is the only witness. */
       let householdLowSince: number | null = null;
       let householdProven = false;
+
+      /** Charge observer (persisted). Read-only for now: it decides nothing. */
+      let tank: TankModel = {
+        storedWh: 0,
+        coldC: 20,
+        fullC: 60,
+        drawWhPerC: DEFAULT_DRAW_WH_PER_C,
+      };
+      /** Probe reading at the previous tick — draws are read from its drops. */
+      let lastProbeC: number | null = null;
+      /** Wall clock of the previous observer update, for the energy integral. */
+      let lastModelAt: number | null = null;
+      /** Stored energy when the running cycle began — the calibration target. */
+      let storedAtCycleStart: number | null = null;
       let mismatchSince: number | null = null;
       let manualOn = false;
 
@@ -1267,6 +1326,31 @@ export function createRecipe(): RecipeDefinition {
         tankFullAt = now;
         tankFullTemp = temp;
         lastFullCycleAt = now;
+
+        // The free anchor. Fit the draw coefficient against what this cycle
+        // actually had to deliver, THEN discard the drift — in that order, or
+        // the evidence is erased before it is used.
+        if (cycleStartedAt !== null && storedAtCycleStart !== null) {
+          const hours = Math.max(0, endedAt - cycleStartedAt) / 3_600_000;
+          const deliveredWh = Math.max(0, heaterPower() * hours - standbyW * hours);
+          const before = tank.drawWhPerC;
+          tank = {
+            ...tank,
+            drawWhPerC: calibrateDrawCoefficient(
+              before,
+              deliveredWh,
+              tankCapacityWh(tankVolumeL, tank) - storedAtCycleStart,
+              tankCapacityWh(tankVolumeL, tank),
+            ),
+          };
+          if (tank.drawWhPerC !== before) {
+            ctx.log(
+              `Modèle recalé : ${Math.round(deliveredWh)} Wh restitués, coefficient de puisage ${before} → ${tank.drawWhPerC} Wh/°C`,
+            );
+          }
+        }
+        tank = anchorOnCutoff(tank, tankVolumeL, temp);
+        storedAtCycleStart = null;
 
         if (cycleStartedAt !== null) {
           const measured = Math.max(0, Math.round((endedAt - cycleStartedAt) / 60000));
@@ -1723,6 +1807,7 @@ export function createRecipe(): RecipeDefinition {
           reason = desired;
           onSince = s.now;
           cycleStartedAt = s.now;
+          storedAtCycleStart = tank.storedWh;
           lowPowerSince = null;
           householdLowSince = null;
           cyclePeakPower = 0;
@@ -1879,6 +1964,39 @@ export function createRecipe(): RecipeDefinition {
         }
       }
 
+      /**
+       * Advance the charge observer one tick. Decides nothing — it only keeps
+       * the energy balance so the model can be judged before it is trusted.
+       *
+       * A draw is read as a *fast* fall of the probe. The separation is wide:
+       * a shower moves it 1.6–4.0 °C between two samples, standing loss moves
+       * it 0.22 °C per hour. Anything slower than the threshold is the tank
+       * cooling, which the standby term already accounts for.
+       */
+      function updateModel(s: Snapshot): void {
+        tank = learnColdInlet(tank, s.temp);
+        const capacity = tankCapacityWh(tankVolumeL, tank);
+
+        if (lastModelAt !== null && capacity > 0) {
+          const hours = Math.max(0, s.now - lastModelAt) / 3_600_000;
+          if (hours > 0 && hours < 6) {
+            let deltaWh = -standbyW * hours;
+            if (relayOn) deltaWh += heaterPower() * hours;
+            tank = applyEnergy(tank, capacity, deltaWh);
+          }
+
+          if (s.temp !== null && lastProbeC !== null) {
+            const drop = lastProbeC - s.temp;
+            if (drop >= DRAW_TICK_DROP_C) {
+              tank = applyEnergy(tank, capacity, -tank.drawWhPerC * drop);
+            }
+          }
+        }
+
+        lastModelAt = s.now;
+        if (s.temp !== null) lastProbeC = s.temp;
+      }
+
       function detectCutoff(s: Snapshot): void {
         if (!relayOn || onSince === null) {
           lowPowerSince = null;
@@ -1933,6 +2051,7 @@ export function createRecipe(): RecipeDefinition {
         try {
           const s = snapshot(new Date());
           reconcileManual(s);
+          updateModel(s);
           detectCutoff(s);
           // After cut-off detection, so a tank that just filled releases its
           // reservation on the same tick rather than sitting on watts the next
@@ -1966,11 +2085,28 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("mode", mode);
         ctx.state.set("powerProven", powerProven);
         ctx.state.set("householdProven", householdProven);
+        ctx.state.set("modelStoredWh", Math.round(tank.storedWh));
+        ctx.state.set("modelColdC", Math.round(tank.coldC * 10) / 10);
+        ctx.state.set("modelFullC", Math.round(tank.fullC * 10) / 10);
+        ctx.state.set("modelDrawWhPerC", tank.drawWhPerC);
       }
 
       function publish(s: Snapshot): void {
         const heat = hcHeatWindow(s.now);
         ctx.state.set("householdPower", s.household);
+        // The whole point of the observer: a charge figure that means something,
+        // next to the probe reading that does not.
+        const capacityWh = tankCapacityWh(tankVolumeL, tank);
+        ctx.state.set("modelStoredWh", Math.round(tank.storedWh));
+        ctx.state.set("modelColdC", round1(tank.coldC));
+        ctx.state.set("modelFullC", round1(tank.fullC));
+        ctx.state.set("modelDrawWhPerC", tank.drawWhPerC);
+        ctx.state.set("tankMeanTemp", round1(modelMeanC(tankVolumeL, tank)));
+        ctx.state.set("tankHotLitres", round1(modelHotLitres(tankVolumeL, tank)));
+        ctx.state.set(
+          "tankCharge",
+          capacityWh > 0 ? Math.round((tank.storedWh / capacityWh) * 100) : null,
+        );
         ctx.state.set("status", relayOn ? "heating" : manualOn ? "manual" : "off");
         ctx.state.set("reason", reason);
         ctx.state.set("mode", mode);
@@ -2045,6 +2181,12 @@ export function createRecipe(): RecipeDefinition {
 
         powerProven = ctx.state.get("powerProven") === true;
         householdProven = ctx.state.get("householdProven") === true;
+        tank = {
+          storedWh: num("modelStoredWh") ?? 0,
+          coldC: num("modelColdC") ?? 20,
+          fullC: num("modelFullC") ?? 60,
+          drawWhPerC: num("modelDrawWhPerC") ?? DEFAULT_DRAW_WH_PER_C,
+        };
 
         const storedMode = ctx.state.get("mode");
         mode = storedMode === "boost" || storedMode === "off" ? storedMode : "auto";

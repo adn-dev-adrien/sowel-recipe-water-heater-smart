@@ -7,6 +7,7 @@ import {
   anchorOnCutoff,
   learnColdInlet,
   calibrateDrawCoefficient,
+  showersFromRise,
   createRecipe,
   resolveBindingAlias,
   computeHcHeatWindow,
@@ -492,7 +493,7 @@ describe("findOnOffOrderAlias", () => {
 // ============================================================
 
 describe("tank model", () => {
-  const base = () => ({ storedWh: 0, coldC: 23, fullC: 63, drawWhPerC: 120, anchored: false });
+  const base = () => ({ storedWh: 0, coldC: 23, fullC: 63, drawWhPerC: 120, showerWh: 1500, anchored: false });
 
   it("prices the tank from its volume and learned span", () => {
     // 280 L raised 40 K = 280 * 1.163 * 40 = 13 026 Wh, the figure the night
@@ -540,6 +541,27 @@ describe("tank model", () => {
     const cap = tankCapacityWh(280, base());
     expect(calibrateDrawCoefficient(500, 13000, 1400, cap)).toBeLessThanOrEqual(600);
     expect(calibrateDrawCoefficient(25, 1400, 13000, cap)).toBeGreaterThanOrEqual(20);
+  });
+});
+
+describe("showersFromRise", () => {
+  it("reads one shower out of a single burst", () => {
+    // The sensors report every 30 min, which is also how long one shower keeps
+    // the room climbing — so one sample of rise is one shower, no finer.
+    expect(showersFromRise(27)).toBe(1);
+    expect(showersFromRise(30)).toBe(1);
+  });
+
+  it("reads a guest-house morning out of a long climb", () => {
+    // Measured: a gîte bathroom climbed for 277 min. That is nine or ten
+    // showers, and billing it as one is what let the tank run dry unnoticed.
+    expect(showersFromRise(277)).toBe(9);
+    expect(showersFromRise(120)).toBe(4);
+  });
+
+  it("never returns zero, and caps at a full house", () => {
+    expect(showersFromRise(1)).toBe(1);
+    expect(showersFromRise(10_000)).toBe(12);
   });
 });
 

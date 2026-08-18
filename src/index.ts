@@ -351,6 +351,10 @@ const LEARN_GROWTH_MIN = 45;
 const LEARN_ALPHA = 0.4;
 
 const HEATER_TYPES = ["water_heater", "switch"];
+/** Anything that can carry a humidity binding. */
+const SENSOR_TYPES = ["sensor", "weather", "thermostat"];
+/** Aliases a bathroom sensor may carry its relative humidity under. */
+const HUMIDITY_ALIASES = ["humidity", "humidity_indoor"];
 
 /** Meters read only to infer the cut-off; never to decide when to heat. */
 const GRID_TYPES = ["main_energy_meter"];
@@ -489,6 +493,9 @@ export interface TankModel {
   fullC: number;
   /** Wh removed per °C of probe collapse during a draw. Fitted nightly. */
   drawWhPerC: number;
+  /** Wh one shower costs. Fitted nightly, and the primary term wherever
+   *  bathroom humidity is available — the probe cannot count showers. */
+  showerWh: number;
   /**
    * False until the first thermostat cut-off. Before that the balance has no
    * origin, so every figure derived from it is meaningless — and "0 %" on a
@@ -519,6 +526,37 @@ const DRAW_TICK_DROP_C = 1;
  * test, and the observer is what makes it available.
  */
 const LEARN_MAX_START_CHARGE = 0.5;
+
+/**
+ * Reading a shower count out of a bathroom's humidity.
+ *
+ * The probe in the tank saturates: once the bottom sits at the inlet
+ * temperature it stops moving, so the second and third shower of a morning
+ * cost the energy balance nothing. Measured here — three showers on 08-18 moved
+ * it 33 °C, one shower on 08-16 moved it 27 °C — the amplitude carries no count
+ * at all. Humidity does, because each shower adds its own burst of vapour.
+ *
+ * The sensors report every 30 min, which is also about how long one shower
+ * keeps the room climbing. So the *duration* of the rise is the count, and the
+ * resolution is one shower — no better, and it must not be claimed. A gîte
+ * bathroom serving ten guests climbs for hours; the 08-16 evening rise ran 277
+ * min, which is nine or ten showers, not one.
+ */
+const SHOWER_SPREAD_MIN = 30;
+/** Guests, not a household: the cap is generous on purpose. */
+const MAX_SHOWERS_PER_RISE = 12;
+/** Points of relative humidity that make a rise a shower rather than weather. */
+const SHOWER_RISE_PTS = 4;
+/** A rise that stops climbing this long is over. */
+const SHOWER_RISE_IDLE_MS = 45 * 60 * 1000;
+/** Starting cost of one shower, Wh. Fitted nightly like `drawWhPerC`. */
+export const DEFAULT_SHOWER_WH = 1500;
+
+/** How many showers a humidity rise of this length stands for. */
+export function showersFromRise(durationMin: number): number {
+  const n = Math.round(durationMin / SHOWER_SPREAD_MIN);
+  return Math.max(1, Math.min(MAX_SHOWERS_PER_RISE, n));
+}
 
 /** Starting guess for `drawWhPerC`, replaced by the first calibration. */
 export const DEFAULT_DRAW_WH_PER_C = 120;
@@ -883,6 +921,16 @@ function buildSlots(): RecipeSlotDef[] {
       group: "cutoff",
     },
     {
+      id: "bathroomSensors",
+      name: "Bathroom sensors",
+      description: "Humidity — counts showers",
+      type: "equipment",
+      required: false,
+      list: true,
+      constraints: { equipmentType: SENSOR_TYPES, crossZone: true, includeDescendants: true },
+      group: "tank",
+    },
+    {
       id: "tankVolume",
       name: "Tank volume (L)",
       description: "Sizes the model",
@@ -989,6 +1037,10 @@ const FR: RecipeLangPack = {
     productionEquipment: {
       name: "Compteur production",
       description: "Obligatoire si solaire",
+    },
+    bathroomSensors: {
+      name: "Salles de bain",
+      description: "Humidité — compte les douches",
     },
     tankVolume: {
       name: "Volume du ballon (L)",
@@ -1105,6 +1157,9 @@ export function createRecipe(): RecipeDefinition {
       const tempOverride = String(params.tempKey ?? "").trim();
       const powerOverride = String(params.powerKey ?? "").trim();
       /** Cut-off fallback only — nothing here decides when to heat. */
+      const bathroomIds: string[] = Array.isArray(params.bathroomSensors)
+        ? (params.bathroomSensors as unknown[]).map(String).filter(Boolean)
+        : [];
       const gridId = params.gridEquipment ? String(params.gridEquipment) : null;
       const productionId = params.productionEquipment ? String(params.productionEquipment) : null;
 
@@ -1188,6 +1243,7 @@ export function createRecipe(): RecipeDefinition {
         coldC: 20,
         fullC: 60,
         drawWhPerC: DEFAULT_DRAW_WH_PER_C,
+        showerWh: DEFAULT_SHOWER_WH,
         anchored: false,
       };
       /** Probe reading at the previous tick — draws are read from its drops. */
@@ -1196,6 +1252,15 @@ export function createRecipe(): RecipeDefinition {
       let lastModelAt: number | null = null;
       /** Stored energy when the running cycle began — the calibration target. */
       let storedAtCycleStart: number | null = null;
+      /** Per bathroom: the humidity rise currently under way, if any. */
+      const rises = new Map<
+        string,
+        { from: number; peak: number; startedAt: number; lastUpAt: number }
+      >();
+      /** Last humidity reading per bathroom, to see the climb. */
+      const lastHumidity = new Map<string, number>();
+      /** Showers counted since the last anchor — published, and fitted on it. */
+      let showersSinceAnchor = 0;
       let mismatchSince: number | null = null;
       let manualOn = false;
 
@@ -1358,21 +1423,23 @@ export function createRecipe(): RecipeDefinition {
         if (cycleStartedAt !== null && storedAtCycleStart !== null) {
           const hours = Math.max(0, endedAt - cycleStartedAt) / 3_600_000;
           const deliveredWh = Math.max(0, heaterPower() * hours - standbyW * hours);
-          const before = tank.drawWhPerC;
-          tank = {
-            ...tank,
-            drawWhPerC: calibrateDrawCoefficient(
-              before,
-              deliveredWh,
-              tankCapacityWh(tankVolumeL, tank) - storedAtCycleStart,
-              tankCapacityWh(tankVolumeL, tank),
-            ),
-          };
-          if (tank.drawWhPerC !== before) {
+          // One nightly scalar fits one coefficient, so fit the one that is
+          // actually carrying the draws on this install.
+          const usingShowers = bathroomIds.length > 0;
+          const before = usingShowers ? tank.showerWh : tank.drawWhPerC;
+          const fitted = calibrateDrawCoefficient(
+            before,
+            deliveredWh,
+            tankCapacityWh(tankVolumeL, tank) - storedAtCycleStart,
+            tankCapacityWh(tankVolumeL, tank),
+          );
+          tank = usingShowers ? { ...tank, showerWh: fitted } : { ...tank, drawWhPerC: fitted };
+          if (fitted !== before) {
             ctx.log(
-              `Modèle recalé : ${Math.round(deliveredWh)} Wh restitués, coefficient de puisage ${before} → ${tank.drawWhPerC} Wh/°C`,
+              `Modèle recalé : ${Math.round(deliveredWh)} Wh restitués sur ${showersSinceAnchor} douche${showersSinceAnchor > 1 ? "s" : ""} — ${usingShowers ? "coût d'une douche" : "coefficient de puisage"} ${before} → ${fitted}`,
             );
           }
+          showersSinceAnchor = 0;
         }
         tank = anchorOnCutoff(tank, tankVolumeL, temp);
         storedAtCycleStart = null;
@@ -2017,7 +2084,9 @@ export function createRecipe(): RecipeDefinition {
             tank = applyEnergy(tank, capacity, deltaWh);
           }
 
-          if (s.temp !== null && lastProbeC !== null) {
+          // With bathrooms wired the showers ARE the draw signal; charging the
+          // probe collapse as well would bill the first shower twice.
+          if (bathroomIds.length === 0 && s.temp !== null && lastProbeC !== null) {
             const drop = lastProbeC - s.temp;
             if (drop >= DRAW_TICK_DROP_C) {
               tank = applyEnergy(tank, capacity, -tank.drawWhPerC * drop);
@@ -2027,6 +2096,51 @@ export function createRecipe(): RecipeDefinition {
 
         lastModelAt = s.now;
         if (s.temp !== null) lastProbeC = s.temp;
+      }
+
+      /**
+       * Count showers from the bathrooms' humidity, and bill them to the tank.
+       *
+       * This exists because the tank probe saturates: once the bottom reaches
+       * the inlet temperature the second and third shower of a morning move it
+       * nothing, and the energy balance was letting them through for free. The
+       * humidity keeps climbing for every one of them.
+       */
+      function detectShowers(s: Snapshot): void {
+        if (bathroomIds.length === 0) return;
+        const capacity = tankCapacityWh(tankVolumeL, tank);
+
+        for (const id of bathroomIds) {
+          const h = readFirstNumeric(ctx.equipmentManager.getByIdWithDetails(id), HUMIDITY_ALIASES);
+          if (h === null) continue;
+          const previous = lastHumidity.get(id);
+          lastHumidity.set(id, h);
+          if (previous === undefined) continue;
+
+          const open = rises.get(id);
+          if (h > previous + 0.4) {
+            if (open) {
+              open.peak = Math.max(open.peak, h);
+              open.lastUpAt = s.now;
+            } else {
+              rises.set(id, { from: previous, peak: h, startedAt: s.now, lastUpAt: s.now });
+            }
+            continue;
+          }
+
+          // Still climbing? Wait. Stopped for long enough? The rise is over.
+          if (!open || s.now - open.lastUpAt < SHOWER_RISE_IDLE_MS) continue;
+          rises.delete(id);
+          if (open.peak - open.from < SHOWER_RISE_PTS) continue;
+
+          const minutes = Math.max(0, open.lastUpAt - open.startedAt) / 60000;
+          const showers = showersFromRise(minutes);
+          showersSinceAnchor += showers;
+          if (capacity > 0) tank = applyEnergy(tank, capacity, -showers * tank.showerWh);
+          ctx.log(
+            `${showers} douche${showers > 1 ? "s" : ""} détectée${showers > 1 ? "s" : ""} — ${nameOf(id)}, humidité +${Math.round(open.peak - open.from)} pts sur ${Math.round(minutes)} min`,
+          );
+        }
       }
 
       function detectCutoff(s: Snapshot): void {
@@ -2084,6 +2198,7 @@ export function createRecipe(): RecipeDefinition {
           const s = snapshot(new Date());
           reconcileManual(s);
           updateModel(s);
+          detectShowers(s);
           detectCutoff(s);
           // After cut-off detection, so a tank that just filled releases its
           // reservation on the same tick rather than sitting on watts the next
@@ -2145,6 +2260,8 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("modelFullC", round1(tank.fullC));
         ctx.state.set("modelDrawWhPerC", tank.drawWhPerC);
         ctx.state.set("modelAnchored", tank.anchored);
+        ctx.state.set("modelShowerWh", tank.showerWh);
+        ctx.state.set("showersSinceAnchor", showersSinceAnchor);
         ctx.state.set("tankMeanTemp", round1(modelMeanC(tankVolumeL, tank)));
         // Kept for analysis, deliberately not surfaced: see the summary above.
         ctx.state.set("tankHotLitres", round1(modelHotLitres(tankVolumeL, tank)));
@@ -2247,6 +2364,7 @@ export function createRecipe(): RecipeDefinition {
           coldC: num("modelColdC") ?? 20,
           fullC: num("modelFullC") ?? 60,
           drawWhPerC: num("modelDrawWhPerC") ?? DEFAULT_DRAW_WH_PER_C,
+          showerWh: num("modelShowerWh") ?? DEFAULT_SHOWER_WH,
           anchored: ctx.state.get("modelAnchored") === true,
         };
 

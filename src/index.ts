@@ -509,6 +509,17 @@ const WH_PER_LITRE_KELVIN = 1.163;
  */
 const DRAW_TICK_DROP_C = 1;
 
+/**
+ * A cycle only teaches the off-peak duration if it started from a tank that
+ * was genuinely low.
+ *
+ * The duration floor alone is not enough: a 39 min top-up on an almost full
+ * tank cleared it and dragged the estimate from 151 to 114 min, which then
+ * left the next night's cycle short of the thermostat. Charge is the honest
+ * test, and the observer is what makes it available.
+ */
+const LEARN_MAX_START_CHARGE = 0.5;
+
 /** Starting guess for `drawWhPerC`, replaced by the first calibration. */
 export const DEFAULT_DRAW_WH_PER_C = 120;
 
@@ -1334,6 +1345,13 @@ export function createRecipe(): RecipeDefinition {
         tankFullTemp = temp;
         lastFullCycleAt = now;
 
+        // Read before anchoring: the anchor overwrites both of these.
+        const capacityAtStart = tankCapacityWh(tankVolumeL, tank);
+        const chargeAtStart =
+          tank.anchored && capacityAtStart > 0 && storedAtCycleStart !== null
+            ? storedAtCycleStart / capacityAtStart
+            : null;
+
         // The free anchor. Fit the draw coefficient against what this cycle
         // actually had to deliver, THEN discard the drift — in that order, or
         // the evidence is erased before it is used.
@@ -1365,8 +1383,13 @@ export function createRecipe(): RecipeDefinition {
           // See LEARN_MIN_MEASURED_MIN: a top-up is short by definition, and
           // letting it in walks the estimate down until the off-peak placement
           // no longer covers a real heat-up.
+          // `chargeAtStart === null` means the observer has no origin yet, so
+          // the duration floor stands alone — as it did before the model.
+          const startedLow = chargeAtStart === null || chargeAtStart < LEARN_MAX_START_CHARGE;
           const teaches =
-            (reason === "hc" || reason === "boost") && measured >= LEARN_MIN_MEASURED_MIN;
+            (reason === "hc" || reason === "boost") &&
+            measured >= LEARN_MIN_MEASURED_MIN &&
+            startedLow;
           if (teaches) {
             hcEstimateMin = learnEstimate(hcEstimateMin, measured, true, currentWindowMin());
           }
@@ -1376,7 +1399,9 @@ export function createRecipe(): RecipeDefinition {
             }). ${
               teaches
                 ? `Estimation de chauffe : ${hcEstimateMin} min`
-                : `Cycle trop court pour être représentatif — estimation inchangée (${hcEstimateMin} min)`
+                : startedLow
+                  ? `Cycle trop court pour être représentatif — estimation inchangée (${hcEstimateMin} min)`
+                  : `Ballon déjà chargé à ${Math.round((chargeAtStart as number) * 100)} % au départ — estimation inchangée (${hcEstimateMin} min)`
             }`,
           );
         } else {
@@ -2100,6 +2125,17 @@ export function createRecipe(): RecipeDefinition {
 
       function publish(s: Snapshot): void {
         const heat = hcHeatWindow(s.now);
+        // Instrumentation: five nights have started exactly 120 min before the
+        // computed placement, and nothing in the code explains it. Publish the
+        // resolved slot and the placement every tick — the published label was
+        // written only on change, so it could not be compared with the values
+        // the decision actually used.
+        const slot = resolveHcWindow();
+        ctx.state.set("hcSlotFrom", slot ? minutesToHm(slot.startMin) : null);
+        ctx.state.set("hcSlotTo", slot ? minutesToHm(slot.endMin) : null);
+        ctx.state.set("hcHeatFrom", heat ? minutesToHm(heat.startMin) : null);
+        ctx.state.set("hcHeatTo", heat ? minutesToHm(heat.endMin) : null);
+        ctx.state.set("nowMin", s.nowMin);
         ctx.state.set("householdPower", s.household);
         // The whole point of the observer: a charge figure that means something,
         // next to the probe reading that does not.
@@ -2110,6 +2146,7 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("modelDrawWhPerC", tank.drawWhPerC);
         ctx.state.set("modelAnchored", tank.anchored);
         ctx.state.set("tankMeanTemp", round1(modelMeanC(tankVolumeL, tank)));
+        // Kept for analysis, deliberately not surfaced: see the summary above.
         ctx.state.set("tankHotLitres", round1(modelHotLitres(tankVolumeL, tank)));
         const charge =
           tank.anchored && capacityWh > 0
@@ -2121,12 +2158,14 @@ export function createRecipe(): RecipeDefinition {
         // observer is visible without an API call, so it carries the model and
         // the probe side by side — the whole point being that they disagree.
         const meanC = modelMeanC(tankVolumeL, tank);
-        const litres = modelHotLitres(tankVolumeL, tank);
+        // No equivalent-litres figure. It reads as "four showers left" because
+        // it assumes perfect stratification; the tank is mixed enough that a
+        // 47 °C mean gave a cold shower while that number said 191 L.
         ctx.state.set(
           "summary",
-          charge === null || meanC === null || litres === null
+          charge === null || meanC === null
             ? "Modèle de charge : en attente du premier ancrage"
-            : `Charge ${charge} % · ${Math.round(litres)} L · modèle ${meanC.toFixed(0)} °C` +
+            : `Charge ${charge} % · modèle ${meanC.toFixed(0)} °C` +
               (s.temp !== null ? ` / sonde ${s.temp.toFixed(0)} °C` : ""),
         );
         ctx.state.set("status", relayOn ? "heating" : manualOn ? "manual" : "off");

@@ -1171,6 +1171,43 @@ describe("createInstance", () => {
     handle.stop();
   });
 
+  it("refuses to learn the duration from a cycle that started nearly full", async () => {
+    // The regression this guards: a 39 min top-up on an almost full tank
+    // dragged the estimate 151 -> 114 min, and the next night's cycle then hit
+    // the end of the window before the thermostat.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70, hcEstimate: "3h" },
+      h.ctx as never,
+    );
+    // First cycle anchors the observer on a full tank. It still teaches: with
+    // no origin yet, the duration floor stands alone, as it did before.
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(35);
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+    expect(h.state.get("tankCharge")).toBe(100);
+    const estimate = h.state.get("hcEstimateMin");
+
+    // A small draw: enough to release the tank-full latch, not enough to empty
+    // anything. The next cycle therefore starts on a nearly full tank.
+    h.setBinding(HEATER, "water_temperature", 56);
+    h.setBinding(HEATER, "power", 2200);
+    await advance(15); // clears MIN_OFF and lets the relay close again
+    expect(h.state.get("relayOn")).toBe(true);
+    expect(h.state.get("tankCharge")).toBeGreaterThan(90);
+
+    await advance(35); // long enough to clear the duration floor
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+
+    expect(h.state.get("hcEstimateMin")).toBe(estimate);
+    expect(h.logLines.join(" ")).toContain("déjà chargé");
+    handle.stop();
+  });
+
   it("puts the model and the probe side by side on the card", async () => {
     // state.summary is the only place the observer shows without an API call.
     at("2026-08-10T03:00:00");

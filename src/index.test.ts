@@ -1193,6 +1193,36 @@ describe("createInstance", () => {
     handle.stop();
   });
 
+  it("grows the estimate when the window closes without a cut-off, on household proof", async () => {
+    // The ratchet this fixes: the cut-off that SHRINKS the estimate is detected
+    // from the household total on installs with no channel of their own, but
+    // growth used to demand a dedicated channel. One way only, 240 -> 114 min,
+    // until the off-peak cycle no longer reached the thermostat.
+    at("2026-08-10T05:00:00"); // inside the window, an hour before it closes
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 30 },
+      ],
+      availableSurplusW: 0,
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, gridEquipment: METER, hcEstimate: "2h" },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("relayOn")).toBe(true);
+    h.setBinding(METER, "power", 2400); // proves the household channel
+    await advance(30);
+    expect(h.state.get("householdProven")).toBe(true);
+    const before = h.state.get("hcEstimateMin") as number;
+
+    await advance(35); // 06:00 — the window closes, no cut-off ever seen
+    expect(h.state.get("hcEstimateMin")).toBe(before + 45);
+    expect(h.logLines.join(" ")).toContain("Fin de plage sans coupure");
+    handle.stop();
+  });
+
   it("refuses to learn the duration from a cycle that started nearly full", async () => {
     // The regression this guards: a 39 min top-up on an almost full tank
     // dragged the estimate 151 -> 114 min, and the next night's cycle then hit

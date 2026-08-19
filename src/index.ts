@@ -547,6 +547,16 @@ const SHOWER_SPREAD_MIN = 30;
 const MAX_SHOWERS_PER_RISE = 12;
 /** Points of relative humidity that make a rise a shower rather than weather. */
 const SHOWER_RISE_PTS = 4;
+/**
+ * Jump between two consecutive readings that opens a rise.
+ *
+ * Rate is what separates a shower from the weather, and the margin is wide:
+ * measured showers climb 0.10–0.22 points per minute, while the overnight
+ * drift that fooled the first version — both gîte bathrooms gaining 10 points
+ * between 21:00 and 02:00 with the room temperature dead flat — ran at 0.036.
+ * At a 30 min cadence that is ~6 points per sample against ~1.
+ */
+const SHOWER_STEP_PTS = 2;
 /** A rise that stops climbing this long is over. */
 const SHOWER_RISE_IDLE_MS = 45 * 60 * 1000;
 /** Starting cost of one shower, Wh. Fitted nightly like `drawWhPerC`. */
@@ -1940,8 +1950,13 @@ export function createRecipe(): RecipeDefinition {
             !tankFull &&
             !s.inHcHeat &&
             cycleStartedAt !== null &&
-            powerAlias() !== null &&
-            powerProven
+            // Same standard of proof as the shrink path, or the estimate can
+            // only ever go down: the cut-off that shortens it is detected from
+            // the household total on installs with no channel of their own, so
+            // the window closing without a cut-off has to count from there too.
+            // Asymmetric proof is what walked this instance 240 -> 114 min
+            // until its off-peak cycle no longer reached the thermostat.
+            (powerProven || householdProven)
           ) {
             hcEstimateMin = learnEstimate(hcEstimateMin, 0, false, currentWindowMin());
             ctx.log(
@@ -2118,7 +2133,7 @@ export function createRecipe(): RecipeDefinition {
           if (previous === undefined) continue;
 
           const open = rises.get(id);
-          if (h > previous + 0.4) {
+          if (h - previous >= (rises.has(id) ? 0.4 : SHOWER_STEP_PTS)) {
             if (open) {
               open.peak = Math.max(open.peak, h);
               open.lastUpAt = s.now;

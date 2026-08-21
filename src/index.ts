@@ -355,6 +355,8 @@ const HEATER_TYPES = ["water_heater", "switch"];
 const SENSOR_TYPES = ["sensor", "weather", "thermostat"];
 /** Aliases a bathroom sensor may carry its relative humidity under. */
 const HUMIDITY_ALIASES = ["humidity", "humidity_indoor"];
+/** A meter wired to the heater alone — better than any fallback. */
+const METER_TYPES = ["energy_meter", "switch", "sensor"];
 
 /** Meters read only to infer the cut-off; never to decide when to heat. */
 const GRID_TYPES = ["main_energy_meter"];
@@ -941,6 +943,15 @@ function buildSlots(): RecipeSlotDef[] {
       group: "tank",
     },
     {
+      id: "powerEquipment",
+      name: "Heater meter",
+      description: "Its own metering",
+      type: "equipment",
+      required: false,
+      constraints: { equipmentType: METER_TYPES, crossZone: true },
+      group: "tank",
+    },
+    {
       id: "tankVolume",
       name: "Tank volume (L)",
       description: "Sizes the model",
@@ -1051,6 +1062,10 @@ const FR: RecipeLangPack = {
     bathroomSensors: {
       name: "Salles de bain",
       description: "Humidité — compte les douches",
+    },
+    powerEquipment: {
+      name: "Compteur du CE",
+      description: "Mesure dédiée au ballon",
     },
     tankVolume: {
       name: "Volume du ballon (L)",
@@ -1167,6 +1182,7 @@ export function createRecipe(): RecipeDefinition {
       const tempOverride = String(params.tempKey ?? "").trim();
       const powerOverride = String(params.powerKey ?? "").trim();
       /** Cut-off fallback only — nothing here decides when to heat. */
+      const powerMeterId = params.powerEquipment ? String(params.powerEquipment) : null;
       const bathroomIds: string[] = Array.isArray(params.bathroomSensors)
         ? (params.bathroomSensors as unknown[]).map(String).filter(Boolean)
         : [];
@@ -1179,6 +1195,32 @@ export function createRecipe(): RecipeDefinition {
           ? resolveBindingAlias(eq.dataBindings, tempOverride, "water_temperature", "temperature")
           : null;
       }
+      /**
+       * Label of the dedicated channel, whichever equipment carries it.
+       *
+       * A meter of its own is strictly better than the household fallback: it
+       * proves the cut-off, teaches the cycle duration and measures the real
+       * draw. It just does not always live on the heater — a metering plug or
+       * a clamp is its own equipment, and `powerKey` could only ever point
+       * inside the heater's own bindings.
+       */
+      function powerChannel(): string | null {
+        if (powerMeterId) return nameOf(powerMeterId);
+        return powerAlias();
+      }
+
+      /** Watts the heater is drawing, from whichever channel exists. */
+      function readHeaterPowerW(): number | null {
+        if (powerMeterId) {
+          return readFirstNumeric(
+            ctx.equipmentManager.getByIdWithDetails(powerMeterId),
+            POWER_ALIASES,
+          );
+        }
+        const key = powerAlias();
+        return key ? readNumeric(heaterEq(), key) : null;
+      }
+
       function powerAlias(): string | null {
         const eq = heaterEq();
         return eq ? resolveBindingAlias(eq.dataBindings, powerOverride, "power", "power") : null;
@@ -1716,8 +1758,7 @@ export function createRecipe(): RecipeDefinition {
         const temp = tKey ? readNumeric(eq, tKey, tempMaxAgeMs) : null;
         // Power keeps core's `stale` rule (2 min for the category): cut-off
         // detection is only meaningful on a live reading.
-        const pKey = powerAlias();
-        const power = pKey ? readNumeric(eq, pKey) : null;
+        const power = readHeaterPowerW();
 
         if (tKey) {
           if (temp === null) {
@@ -1966,10 +2007,10 @@ export function createRecipe(): RecipeDefinition {
           if (!(await sendRelay("off"))) return;
           // A whole cycle with the relay closed and no heating-level draw ever
           // seen is a wiring/binding problem, not a hot tank — say so.
-          if (powerAlias() && !powerProven && onSince !== null && s.now - onSince > STARTUP_GRACE_MS) {
+          if (powerChannel() && !powerProven && onSince !== null && s.now - onSince > STARTUP_GRACE_MS) {
             warnOnce(
               "peak-never-seen",
-              `La mesure "${powerAlias()}" n'a jamais dépassé ${Math.round(
+              `La mesure "${powerChannel()}" n'a jamais dépassé ${Math.round(
                 cyclePeakPower,
               )} W pendant la chauffe (attendu ≈ ${heaterPower()} W) — détection de coupure inactive tant qu'elle n'a pas vu le chauffe-eau consommer`,
             );
@@ -2174,7 +2215,7 @@ export function createRecipe(): RecipeDefinition {
           powerProven = true;
           ctx.state.set("powerProven", true);
           ctx.log(
-            `Mesure "${powerAlias()}" validée — ${Math.round(cyclePeakPower)} W observés en chauffe`,
+            `Mesure "${powerChannel()}" validée — ${Math.round(cyclePeakPower)} W observés en chauffe`,
           );
         }
         if (s.now - onSince < STARTUP_GRACE_MS) return;
@@ -2415,8 +2456,8 @@ export function createRecipe(): RecipeDefinition {
       const capacity = readCapacityState();
       const capabilities = [
         tempAlias() ? `sonde ${tempAlias()}` : "sans sonde (chauffe de secours désactivée)",
-        powerAlias()
-          ? `puissance ${powerAlias()}`
+        powerChannel()
+          ? `puissance ${powerChannel()}`
           : gridId
             ? `coupure déduite de la consommation totale (${nameOf(gridId)}${
                 productionId ? ` + ${nameOf(productionId)}` : ", sans compteur de production"
@@ -2443,7 +2484,7 @@ export function createRecipe(): RecipeDefinition {
           "Aucune sonde de température trouvée sur le chauffe-eau : la chauffe de secours est inactive, la recette ne fera que les heures creuses et le solaire",
         );
       }
-      if (!powerAlias() && !gridId) {
+      if (!powerChannel() && !gridId) {
         warnOnce(
           "no-power",
           "Aucune mesure de puissance : impossible de détecter la coupure du thermostat, les cycles seront bornés par la plage horaire et la durée maximale. Un compteur général renseigné dans les réglages avancés suffirait à la déduire.",

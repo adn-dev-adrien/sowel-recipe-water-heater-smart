@@ -1223,6 +1223,35 @@ describe("createInstance", () => {
     handle.stop();
   });
 
+  it("takes the heater's power from a meter of its own when one is bound", async () => {
+    // A metering plug or clamp is its own equipment; powerKey could only ever
+    // point inside the heater's own bindings, so such installs were stuck on
+    // the household fallback.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 45 },
+      ],
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, powerEquipment: METER, tankVolume: 280 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    h.setBinding(METER, "power", 2200); // the heater drawing, seen on the meter
+    await advance(30);
+    expect(h.state.get("powerProven")).toBe(true); // the household path cannot do this
+
+    h.setBinding(METER, "power", 4); // thermostat opens
+    await advance(6);
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    handle.stop();
+  });
+
   it("refuses to learn the duration from a cycle that started nearly full", async () => {
     // The regression this guards: a 39 min top-up on an almost full tank
     // dragged the estimate 151 -> 114 min, and the next night's cycle then hit

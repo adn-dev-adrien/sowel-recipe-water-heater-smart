@@ -27,6 +27,7 @@ import {
 const HEATER = "heater-1";
 const METER = "meter-1";
 const PRODUCTION = "production-1";
+const FORECAST = "forecast-1";
 
 type Binding = {
   alias: string;
@@ -65,6 +66,8 @@ interface HarnessOptions {
   arbiterEnabled?: boolean;
   /** `getCapacityState().availableSurplusW` — >0 means the sun is producing. */
   availableSurplusW?: number | null;
+  /** Tomorrow's forecast condition on the fake forecast equipment. */
+  tomorrow?: string;
   /** Energy profile on the heater, i.e. an admin enrolled it (spec 140). */
   heaterProfile?: {
     class: "comfort" | "deferrable";
@@ -137,6 +140,16 @@ function buildHarness(opts: HarnessOptions = {}) {
       type: "main_energy_meter",
       status: "online",
       dataBindings: meterBindings,
+      orderBindings: [],
+    },
+    [FORECAST]: {
+      id: FORECAST,
+      name: "Prévision",
+      type: "weather_forecast",
+      status: "online",
+      dataBindings: [
+        { alias: "j1_condition", category: "weather_condition", value: opts.tomorrow ?? "sunny" },
+      ] as Binding[],
       orderBindings: [],
     },
     [PRODUCTION]: {
@@ -1220,6 +1233,35 @@ describe("createInstance", () => {
     await advance(35); // 06:00 — the window closes, no cut-off ever seen
     expect(h.state.get("hcEstimateMin")).toBe(before + 45);
     expect(h.logLines.join(" ")).toContain("Fin de plage sans coupure");
+    handle.stop();
+  });
+
+  it("takes the whole off-peak window when tomorrow brings no sun", async () => {
+    // The cycle runs either way; the forecast decides whether it may stop
+    // short. No sun tomorrow means nothing will finish the tank, so the cheap
+    // window is the last chance and the placement takes all of it.
+    at("2026-08-09T21:50:00"); // just before the 22:00 window opens
+    const h = buildHarness({ tomorrow: "rainy" });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, forecastEquipment: FORECAST, hcEstimate: "2h" },
+      h.ctx as never,
+    );
+    await advance(15); // 22:05 — inside the window, well before a late placement
+    expect(h.state.get("relayOn")).toBe(true);
+    expect(h.state.get("hcWindow")).toBe("22:00 → 06:00");
+    handle.stop();
+  });
+
+  it("keeps the late placement when tomorrow is sunny", async () => {
+    at("2026-08-09T21:50:00");
+    const h = buildHarness({ tomorrow: "sunny" });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, forecastEquipment: FORECAST, hcEstimate: "2h" },
+      h.ctx as never,
+    );
+    await advance(15); // 22:05 — a late placement does not start until 04:00
+    expect(h.state.get("relayOn")).toBeFalsy();
+    expect(h.state.get("hcWindow")).toBe("04:00 → 06:00");
     handle.stop();
   });
 

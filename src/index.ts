@@ -357,6 +357,20 @@ const SENSOR_TYPES = ["sensor", "weather", "thermostat"];
 const HUMIDITY_ALIASES = ["humidity", "humidity_indoor"];
 /** A meter wired to the heater alone — better than any fallback. */
 const METER_TYPES = ["energy_meter", "switch", "sensor"];
+const FORECAST_TYPES = ["weather_forecast"];
+/** `j1` is tomorrow: the plugin fills daily index 1..5, index 0 being today. */
+const FORECAST_CONDITION_ALIASES = ["j1_condition"];
+/**
+ * Conditions that promise enough sun to finish the tank during the day.
+ *
+ * Deliberately just `sunny`, which is what Adrien asked for. My own reading of
+ * his surplus data is that `partly_cloudy` days also produce a usable surplus,
+ * so this is the knob to revisit first if the recipe starts forcing full nights
+ * on days the panels would have covered.
+ */
+const SUNNY_TOMORROW = new Set(["sunny"]);
+/** Below this charge, a sunless tomorrow is worth a full off-peak window. */
+const FORECAST_FULL_CHARGE_BELOW = 0.8;
 
 /** Meters read only to infer the cut-off; never to decide when to heat. */
 const GRID_TYPES = ["main_energy_meter"];
@@ -943,6 +957,15 @@ function buildSlots(): RecipeSlotDef[] {
       group: "tank",
     },
     {
+      id: "forecastEquipment",
+      name: "Forecast",
+      description: "Full night if no sun",
+      type: "equipment",
+      required: false,
+      constraints: { equipmentType: FORECAST_TYPES, crossZone: true },
+      group: "tank",
+    },
+    {
       id: "powerEquipment",
       name: "Heater meter",
       description: "Its own metering",
@@ -1063,6 +1086,10 @@ const FR: RecipeLangPack = {
       name: "Salles de bain",
       description: "Humidité — compte les douches",
     },
+    forecastEquipment: {
+      name: "Prévision météo",
+      description: "Nuit pleine si pas de soleil",
+    },
     powerEquipment: {
       name: "Compteur du CE",
       description: "Mesure dédiée au ballon",
@@ -1182,6 +1209,7 @@ export function createRecipe(): RecipeDefinition {
       const tempOverride = String(params.tempKey ?? "").trim();
       const powerOverride = String(params.powerKey ?? "").trim();
       /** Cut-off fallback only — nothing here decides when to heat. */
+      const forecastId = params.forecastEquipment ? String(params.forecastEquipment) : null;
       const powerMeterId = params.powerEquipment ? String(params.powerEquipment) : null;
       const bathroomIds: string[] = Array.isArray(params.bathroomSensors)
         ? (params.bathroomSensors as unknown[]).map(String).filter(Boolean)
@@ -1207,6 +1235,52 @@ export function createRecipe(): RecipeDefinition {
       function powerChannel(): string | null {
         if (powerMeterId) return nameOf(powerMeterId);
         return powerAlias();
+      }
+
+      /** First alias yielding a non-empty string — forecast conditions are enums. */
+      function readFirstText(eq: EquipmentLite | null, aliases: string[]): string | null {
+        if (!eq) return null;
+        for (const alias of aliases) {
+          const b = eq.dataBindings.find((d) => d.alias === alias);
+          const v = b && b.stale !== true ? b.value : undefined;
+          if (typeof v === "string" && v.trim() !== "") return v.trim();
+        }
+        return null;
+      }
+
+      /**
+       * Should tonight fill the tank completely rather than place a short cycle?
+       *
+       * The off-peak cycle runs every night either way; what the forecast
+       * decides is whether it may stop short. With sun tomorrow the tank can
+       * finish the day on free watts, so the usual late placement stands. With
+       * anything else there is nothing to finish it, and the cheap window is
+       * the last chance — take all of it.
+       *
+       * Gated on the charge so a tank that is nearly full does not buy a whole
+       * window it has no use for. Unknown charge counts as low: the observer
+       * has no anchor yet, and cold water tomorrow is worse than a few cheap
+       * kWh tonight.
+       */
+      function forecastWantsFullNight(): boolean {
+        if (!forecastId) return false;
+        const condition = readFirstText(
+          ctx.equipmentManager.getByIdWithDetails(forecastId),
+          FORECAST_CONDITION_ALIASES,
+        );
+        if (condition === null) {
+          warnOnce(
+            "forecast-mute",
+            `Prévision « ${nameOf(forecastId)} » : condition de demain illisible (alias attendu ${FORECAST_CONDITION_ALIASES.join(", ")}) — placement nocturne inchangé`,
+          );
+          return false;
+        }
+        warned.delete("forecast-mute");
+        if (SUNNY_TOMORROW.has(condition)) return false;
+
+        const capacity = tankCapacityWh(tankVolumeL, tank);
+        if (!tank.anchored || capacity <= 0) return true;
+        return tank.storedWh / capacity < FORECAST_FULL_CHARGE_BELOW;
       }
 
       /** Watts the heater is drawing, from whichever channel exists. */
@@ -1679,7 +1753,8 @@ export function createRecipe(): RecipeDefinition {
         const w = resolveHcWindow();
         announceWindow(w);
         if (!w) return null;
-        const effective = needsFullCycle(now) ? "full" : hcMode;
+        const full = needsFullCycle(now) || forecastWantsFullNight();
+        const effective = full ? "full" : hcMode;
         return computeHcHeatWindow(w.startMin, w.endMin, effective, hcEstimateMin);
       }
 

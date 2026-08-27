@@ -135,10 +135,26 @@ Si l'une des deux manque, le journal de l'instance le dit une fois, en nommant l
 | Ce qu'elle déclare | Valeur | Pourquoi |
 | --- | --- | --- |
 | `watts` | Puissance du profil énergie (repli : slot `heaterPower`, puis 2200 W) | Dimensionne la décision d'enclenchement |
-| `toleratedImportW` | 10 % de la puissance, soit 220 W sur un 2,2 kW (slot `toleratedImport` pour forcer) | Une résistance est tout-ou-rien : attendre que l'injection couvre 2,2 kW *entièrement* refuse l'essentiel du surplus d'une journée pour les derniers pour-cent |
+| `toleratedImportW` | Rien, quand la fiche de l'équipement en déclare un (slot `toleratedImport` pour forcer ; à défaut 10 % de la puissance, soit 220 W sur un 2,2 kW) | Une résistance est tout-ou-rien : attendre que l'injection couvre 2,2 kW *entièrement* refuse l'essentiel du surplus d'une journée pour les derniers pour-cent |
 | `slack` | `none` / `some` / `high` selon l'état du ballon | La seule chose que la liste de priorité statique ne peut pas savoir |
+| `reportNeed` | `true` / `false` à chaque tick, tant que la réservation est accordée | Dit à l'arbitre si la résistance tire vraiment, au lieu de le lui faire deviner |
+
+**« Import toléré » se règle sur la fiche de l'équipement, pas ici.** Depuis le cœur 1.50 (#550) c'est une propriété de la charge, lue par l'arbitre pour toutes les réservations. La recette en envoyait un à chaque réservation, ce qui l'écrasait en silence : un « Import toléré : 500 W » saisi sur la page de l'arbitre repartait à 220 W. Elle ne parle plus que si la fiche est muette — même règle que pour la puissance nominale.
 
 **`slack` ne fait que descendre dans la liste, jamais monter.** C'est ce qui le rend inoffensif : personne n'a intérêt à mentir vers le bas. Un ballon à 55 °C avec les heures creuses dans six heures se met en `high` et laisse passer la pompe piscine, alors même que l'utilisateur l'a classé au-dessus. Près du plancher, ou en boost, ou quand le cycle anti-légionelle est dû, il repasse en `none` — et `none` est la seule valeur autorisée à préempter les charges du dessous.
+
+### Dire à l'arbitre si la résistance tire (spec 166, Sowel ≥ 1.60)
+
+L'arbitre lit la puissance **de l'équipement chauffe-eau lui-même**. Ici il n'y en a pas : le relais publie `state` et rien d'autre, et la mesure vient d'un compteur séparé sur lequel la recette a été pointée (`powerEquipment`). Résultat, avant la 1.60 l'arbitre n'avait aucun moyen de savoir ce que faisait la charge : une réservation s'affichait « accordé » plein pot du début à la fin, y compris pendant la fenêtre entre l'ouverture du thermostat et la détection de coupure qui rend la réservation.
+
+La recette déclare donc elle-même, à chaque tick :
+
+- **relais ouvert** → rien ne peut tirer. L'état observé prime sur le nôtre : un ballon allumé à la main consomme la réservation quand même ;
+- **juste après notre propre ordre** (90 s) → notre commande fait foi. Le binding d'état et le compteur portent encore l'ancienne valeur, et le cœur applique une déclaration **sans fenêtre de confirmation** : lire trop tôt journaliserait un aller-retour à chaque démarrage de cycle ;
+- **relais fermé** → ce sont les deux témoins que la détection de coupure entretient déjà qui décident, chacun derrière sa propre preuve : le canal dédié validé (`powerProven`), ou à défaut la consommation totale du logement quand elle passe sous la puissance déclarée (`householdProven`, et il faut le compteur de production renseigné pour qu'elle reste lisible sous soleil). Un témoin qui lit « rien » pendant **1 minute** suffit à déclarer l'arrêt — pas les 5 minutes de `cutoffDelay`, parce que les deux ne répondent pas à la même question : conclure « ballon plein » ouvre le relais et saute un cycle, déclarer « ne tire pas » ne fait que colorer une case de la frise, et le tick suivant peut le défaire. C'est ce qui rend la coupure du thermostat visible sur la surface d'arbitrage **avant** que la réservation soit rendue ;
+- **aucun témoin** → la charge est réputée tourner. « Pas de preuve » n'est pas « à l'arrêt », et c'est aussi ce que fait le cœur pour une réservation qui ne déclare rien.
+
+La déclaration ne pèse que là où l'arbitre n'a rien mesuré : une installation qui binde la puissance sur le chauffe-eau lui-même garde le comportement de la spec 164, la mesure gagne toujours.
 
 ### La réservation reste ouverte pendant les chauffes obligatoires
 
@@ -146,7 +162,7 @@ Quand le plancher ou le cycle heures creuses ferme le relais, la recette **garde
 
 ### Ce que publie l'instance
 
-`surplusClaim` (`pending` / `granted` / la raison du refus), `availableSurplus` (le surplus disponible vu par l'arbitre) et `surplusSlack`. Les anciens `surplus`, `solarStartAt` et `solarStopAt` ont disparu avec les seuils : « pourquoi ça ne chauffe pas en plein soleil ? » se lit maintenant sur une ligne, et le détail complet est dans le journal des décisions de **Énergie → En direct**.
+`surplusClaim` (`pending` / `granted` / la raison du refus), `availableSurplus` (le surplus disponible vu par l'arbitre), `surplusSlack` et `surplusDrawing` (ce que la recette a déclaré en dernier à l'arbitre — c'est la différence entre « accordé » et « accordé, à l'arrêt » sur la surface d'arbitrage). Les anciens `surplus`, `solarStartAt` et `solarStopAt` ont disparu avec les seuils : « pourquoi ça ne chauffe pas en plein soleil ? » se lit maintenant sur une ligne, et le détail complet est dans le journal des décisions de **Énergie → En direct**.
 
 ## Modes
 

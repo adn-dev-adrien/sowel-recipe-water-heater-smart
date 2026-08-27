@@ -33,6 +33,13 @@
  *     load, and allocates the surplus in the *user's* priority order. Two
  *     surplus-aware recipes stop fighting over the same watts.
  *
+ *     While the claim is granted the recipe declares, on every tick, whether
+ *     the resistor is actually drawing (spec 166, Sowel >= 1.60). The arbiter
+ *     reads the *heater equipment's* own power binding and there is none here
+ *     — the meter is a separate equipment — so without the declaration a grant
+ *     renders as a solid "accordé" from beginning to end, thermostat cut-off
+ *     included.
+ *
  *     Nothing about the heater's configuration is solar any more: enable
  *     arbitration on the equipment (admin) and place it in the priority list.
  *     If that was not done, or the arbiter is off, or the home has no PV at
@@ -135,6 +142,10 @@ interface EnergyLoadProfileLite {
   nominalPowerW: number;
   minOnS: number;
   minOffS: number;
+  /** Core #550 (Sowel >= 1.50): the grid draw the *user* accepts to buy for
+   *  this load, set once on the equipment. Same drift trap as `nominalPowerW`:
+   *  a second copy in the recipe form silently overrides the arbiter page. */
+  toleratedImportW?: number;
   learned?: { watts: number; atIso: string; runs: number };
 }
 
@@ -171,6 +182,10 @@ interface CapacityClaimHandle {
   status(): "pending" | "granted" | "denied" | "released";
   readonly deniedReason?: CapacityDenyReason;
   release(): void;
+  /** Spec 166 (Sowel >= 1.60) — declare whether the load needs current right
+   *  now. Optional on purpose: on an older core the method is absent, the call
+   *  is skipped, and the recipe behaves exactly as it did before. */
+  reportNeed?(need: boolean): void;
 }
 
 interface RecipeEnergyHelpers {
@@ -321,6 +336,19 @@ const CUTOFF_MIN_PEAK_RATIO = 0.5;
  *  - CUTOFF — below this, sustained for `cutoffDelay`, the resistor is off.
  * PROVEN sits above CUTOFF on purpose: the gap is the hysteresis.
  */
+/**
+ * How long a witness has to keep reading "no draw" before the recipe declares
+ * the load idle to the arbiter (spec 166).
+ *
+ * Far shorter than `cutoffDelay`, because the two answer different questions:
+ * concluding "tank full" opens the relay and skips a cycle, while declaring
+ * "not drawing" only paints a ribbon cell and is undone by the next tick. It
+ * is not zero either — both witnesses are samples, and the core applies a
+ * declaration with no confirmation window of its own, so one stale reading
+ * would journal a draw-stopped/draw-started pair for nothing.
+ */
+const NEED_LOW_CONFIRM_MS = 60_000;
+
 const HOUSEHOLD_PROVEN_RATIO = 0.9;
 const HOUSEHOLD_CUTOFF_RATIO = 0.8;
 
@@ -1336,11 +1364,29 @@ export function createRecipe(): RecipeDefinition {
       const cutoffDelayMs = ctx.helpers.parseDuration(params.cutoffDelay ?? "5m");
       const maxCycleMs = ctx.helpers.parseDuration(params.maxCycle ?? "6h");
 
-      /** Grid the recipe accepts to buy to catch a nearly-free cycle. */
-      function toleratedImportW(): number {
+      /**
+       * Grid the recipe accepts to buy to catch a nearly-free cycle.
+       *
+       * Since core #550 (Sowel 1.50) this is a property of the *equipment* —
+       * "Import toléré (W)" on its energy profile — read by the arbiter for
+       * every claim on that load. Sending a figure of our own on every claim
+       * overrode it silently, so an admin who set 500 W on the arbiter page
+       * still got the recipe's 10 %: the exact drift `heaterPower()` already
+       * refuses. Resolution order is therefore the same as the rating's, and
+       * `undefined` means "say nothing, let the profile speak".
+       */
+      function toleratedImportW(): number | undefined {
+        const explicit = toNumber(params.toleratedImport);
+        if (explicit !== null) return explicit;
+        const profiled = heaterEq()?.energyProfile?.toleratedImportW;
+        if (typeof profiled === "number") return undefined;
+        return Math.round(heaterPower() * DEFAULT_IMPORT_TOLERANCE_RATIO);
+      }
+
+      /** What the claim will effectively run with, for the journal line. */
+      function effectiveToleratedImportW(): number {
         return (
-          toNumber(params.toleratedImport) ??
-          Math.round(heaterPower() * DEFAULT_IMPORT_TOLERANCE_RATIO)
+          toleratedImportW() ?? heaterEq()?.energyProfile?.toleratedImportW ?? 0
         );
       }
 
@@ -1401,6 +1447,10 @@ export function createRecipe(): RecipeDefinition {
       let claim: CapacityClaimHandle | null = null;
       /** Slack the live claim was opened with — re-issuing is how it changes. */
       let claimSlack: CapacitySlack | null = null;
+      /** Spec 166: last value handed to the arbiter, for the status line. */
+      let lastReportedNeed: boolean | null = null;
+      /** A core whose handle throws is worth saying once, not every 30 s. */
+      let reportNeedFailed = false;
       /** Set by the arbiter's callbacks. The *only* solar input this recipe has. */
       let granted = false;
       let lastDenial: CapacityDenyReason | null = null;
@@ -1976,6 +2026,79 @@ export function createRecipe(): RecipeDefinition {
         claimSlack = slack;
       }
 
+      // ── Declared need (spec 166) ──────────────────────────
+
+      /**
+       * Whether the resistor is drawing right now, for the arbiter.
+       *
+       * Author rule 1 (spec 166): while the claim is granted, the claimant says
+       * what its load is doing rather than leaving the arbiter to infer it from
+       * electricity. Here that is not a formality. The arbiter reads the *heater
+       * equipment's own* power binding, and this heater usually has none: the
+       * relay publishes `state` and nothing else, and the draw is measured by a
+       * separate meter this recipe was pointed at (`powerEquipment`). So the
+       * arbiter has no measurement to read, and without this declaration a grant
+       * renders as a solid "accordé" from beginning to end — including the
+       * window between the thermostat opening and the cut-off detection
+       * releasing the claim, which is exactly the "reserving watts, consuming
+       * nothing" case spec 164 exists to expose (#732).
+       *
+       * A measurement on the equipment itself always wins, so an install that
+       * does bind power to the heater is unaffected by what we say here.
+       */
+      function needsCurrent(s: Snapshot): boolean {
+        // Own-order grace. Right after our own ON, both the relay's state
+        // binding and the meter still carry the old OFF/0 W, and the core
+        // applies a declaration with NO confirmation window — reading them
+        // this early would journal a draw-stopped/draw-started pair on every
+        // single cycle start. `STARTUP_GRACE_MS` is the same warm-up the
+        // cut-off detection already waits out.
+        if (relayOn && onSince !== null && s.now - onSince < STARTUP_GRACE_MS) return true;
+
+        // The contact decides first: nothing can draw through an open relay.
+        // The observed state wins over ours when the device publishes one — a
+        // heater someone switched on by hand consumes the grant all the same.
+        const closed = readRelayState(heaterEq()) ?? (relayOn || manualOn);
+        if (!closed) return false;
+
+        // Contact closed. Only a measurement can tell a heating tank from one
+        // whose thermostat has opened, and the cut-off detection already keeps
+        // both witnesses this recipe has, each behind its own standard of
+        // proof: `lowPowerSince` from a dedicated channel that has been seen
+        // carrying the heater, `householdLowSince` from a household total that
+        // cannot contain the resistor. Reading them a minute in rather than
+        // five is what makes the cut-off visible on the arbitration surface
+        // before the release happens.
+        //
+        // Neither latch running means no evidence, and no evidence is not
+        // "idle": the load is declared running, which is also what the core
+        // does for an undeclared grant.
+        const lowSince = lowPowerSince ?? householdLowSince;
+        return lowSince === null || s.now - lowSince < NEED_LOW_CONFIRM_MS;
+      }
+
+      /**
+       * Keep the declaration current on every tick.
+       *
+       * Not only on a change: a revoke drops the declaration with the grant, so
+       * a recipe reporting on transitions alone would go silent across a
+       * revoke/re-grant and its load would read as drawing again. The core
+       * journals transitions only, so restating the same value is free.
+       */
+      function reportNeed(s: Snapshot): void {
+        const need = needsCurrent(s);
+        lastReportedNeed = need;
+        try {
+          claim?.reportNeed?.(need);
+        } catch (err) {
+          // Once per instance: a core that throws on every tick would write
+          // 2880 error lines a day for what is a reporting nicety.
+          if (reportNeedFailed) return;
+          reportNeedFailed = true;
+          ctx.logger.error({ err }, "water-heater-smart: reportNeed failed (logged once)");
+        }
+      }
+
       function decide(s: Snapshot): Reason | null {
         // The arbiter owns this decision entirely: `granted` is set by its
         // callbacks and nothing here looks at a meter. Hysteresis, cloud
@@ -2338,6 +2461,10 @@ export function createRecipe(): RecipeDefinition {
 
           const desired = enforceMaxCycle(s) ? null : decide(s);
           await apply(desired, s);
+          // After apply(), so the declaration describes the relay as this tick
+          // left it rather than as it was found. onGranted() calls evaluate(),
+          // so a fresh grant is described on the same pass that opened it.
+          reportNeed(s);
           publish(s);
         } catch (err: unknown) {
           ctx.logger.error({ err }, "water-heater-smart evaluate failed");
@@ -2429,6 +2556,10 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("surplusClaim", claim ? claim.status() : (lastDenial ?? "none"));
         ctx.state.set("availableSurplus", capacity?.availableSurplusW ?? null);
         ctx.state.set("surplusSlack", claimSlack);
+        // Spec 166 — what we last told the arbiter. On the arbitration surface
+        // this is the difference between "accordé" and "accordé, à l'arrêt",
+        // so it is worth being able to check it here when the two disagree.
+        ctx.state.set("surplusDrawing", lastReportedNeed);
         ctx.state.set("tankFull", tankFull);
         // Without the expiry on screen, a skipped off-peak cycle looks like a
         // recipe that stopped working. It is the single most surprising thing
@@ -2544,7 +2675,7 @@ export function createRecipe(): RecipeDefinition {
             ? "surplus indisponible (chauffe-eau non déclaré comme charge pilotable)"
             : capacity?.enabled === false
               ? "surplus indisponible (arbitrage désactivé)"
-              : `surplus arbitré par Sowel (${heaterPower()} W, soutirage toléré ${toleratedImportW()} W)`,
+              : `surplus arbitré par Sowel (${heaterPower()} W, soutirage toléré ${effectiveToleratedImportW()} W)`,
       ].join(", ");
       ctx.log(
         `Recette démarrée sur ${heaterName} — HC ${

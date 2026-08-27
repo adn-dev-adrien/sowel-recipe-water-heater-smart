@@ -74,7 +74,12 @@ interface HarnessOptions {
     nominalPowerW: number;
     minOnS: number;
     minOffS: number;
+    toleratedImportW?: number;
   } | null;
+  /** Models a Sowel older than 1.60: the handle has no `reportNeed`. */
+  noReportNeed?: boolean;
+  /** Makes `reportNeed` throw, to prove a broken core cannot break the tick. */
+  reportNeedThrows?: boolean;
 }
 
 /**
@@ -95,6 +100,8 @@ interface FakeClaim {
   status: "pending" | "granted" | "denied" | "released";
   onGranted: () => void;
   onRevoked: (reason: string) => void;
+  /** Spec 166 — every value the recipe declared, in order. */
+  needs: boolean[];
 }
 
 /** The instance's off-peak hours, as most tests assume them. */
@@ -187,6 +194,7 @@ function buildHarness(opts: HarnessOptions = {}) {
         status: opts.denyClaimWith ? "denied" : "pending",
         onGranted: req.onGranted,
         onRevoked: req.onRevoked,
+        needs: [],
       };
       claims.push(record);
       return {
@@ -196,6 +204,15 @@ function buildHarness(opts: HarnessOptions = {}) {
         release: () => {
           if (record.status !== "denied") record.status = "released";
         },
+        // Spec 166. Absent on a core older than 1.60 — the recipe must cope.
+        ...(opts.noReportNeed
+          ? {}
+          : {
+              reportNeed: (need: boolean) => {
+                if (opts.reportNeedThrows) throw new Error("arbiter exploded");
+                record.needs.push(need);
+              },
+            }),
       };
     },
     getCapacityState: () => ({
@@ -1520,7 +1537,7 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  it("claims the heater's rating and a tolerated grid draw, both from the profile", async () => {
+  it("claims the heater's rating from the profile, and offers a tolerance only when the profile has none", async () => {
     at("2026-08-09T13:00:00");
     const h = buildHarness({
       heaterProfile: { class: "deferrable", nominalPowerW: 3000, minOnS: 300, minOffS: 300 },
@@ -1530,7 +1547,29 @@ describe("createInstance", () => {
 
     // Nothing in the form said 3000 W: the energy profile is the source of
     // truth for the rating, exactly as the tariff page is for off-peak hours.
+    // This profile carries no tolerance, so the 10 % default is worth sending.
     expect(h.liveClaim()).toMatchObject({ watts: 3000, toleratedImportW: 300 });
+    handle.stop();
+  });
+
+  it("stays silent on the tolerated grid draw when the equipment declares one", async () => {
+    // Core #550: "Import toléré (W)" on the equipment is the user's setting,
+    // and the arbiter reads it for every claim. Sending our own 10 % on top
+    // overrode it silently — an admin who typed 500 W still got 220 W.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({
+      heaterProfile: {
+        class: "deferrable",
+        nominalPowerW: 2200,
+        minOnS: 300,
+        minOffS: 300,
+        toleratedImportW: 500,
+      },
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+
+    expect(h.liveClaim()?.toleratedImportW).toBeUndefined();
     handle.stop();
   });
 
@@ -1543,6 +1582,157 @@ describe("createInstance", () => {
     );
     await advance(1);
     expect(h.liveClaim()?.toleratedImportW).toBe(0);
+    handle.stop();
+  });
+
+  it("keeps the form override ahead of the equipment's own tolerance", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({
+      heaterProfile: {
+        class: "deferrable",
+        nominalPowerW: 2200,
+        minOnS: 300,
+        minOffS: 300,
+        toleratedImportW: 500,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, toleratedImport: 50 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.liveClaim()?.toleratedImportW).toBe(50);
+    handle.stop();
+  });
+
+  // ── Declared need (spec 166) ─────────────────────────────
+
+  it("declares the heater drawing while it heats on the grant", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({ initialState: { powerProven: true } });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    h.grant();
+    await advance(3); // past the startup grace, resistor drawing
+
+    const c = h.liveClaim();
+    expect(c?.needs.at(-1)).toBe(true);
+    expect(h.state.get("surplusDrawing")).toBe(true);
+    handle.stop();
+  });
+
+  it("declares the heater idle as soon as the thermostat opens, before the cut-off frees the claim", async () => {
+    // The whole point on this install: the arbiter reads the *heater's* own
+    // power binding and there is none — the meter is a separate equipment.
+    // Without the declaration the grant renders solid "accordé" right through
+    // the window between the thermostat opening and the release.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({
+      drawWhenOn: 0, // relay closes, thermostat already open
+      initialState: { powerProven: true },
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    h.grant();
+    await advance(3); // startup grace done, cut-off delay (5 min) not yet
+
+    const c = h.claims[0];
+    expect(c.needs.at(-1)).toBe(false);
+    expect(c.status).toBe("granted"); // still holding it — that is the point
+    handle.stop();
+  });
+
+  it("declares a heater that ignores the order idle, not drawing", async () => {
+    // Intent alone would keep saying "drawing" on a load whose breaker is off,
+    // which is the exact situation the declaration exists to expose.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({ deviceObeys: false, initialState: { powerProven: true } });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    h.grant();
+    await advance(1); // inside the own-order grace: our command stands
+    expect(h.claims[0].needs.at(-1)).toBe(true);
+
+    await advance(3); // grace over, the relay never moved
+    expect(h.claims[0].needs.at(-1)).toBe(false);
+    handle.stop();
+  });
+
+  it("declares the cut-off from the household total when the heater has no meter of its own", async () => {
+    // The reference install: no power binding on the heater, the total is the
+    // only witness. It cannot prove a draw, but a total below the declared
+    // rating proves the resistor is off — enough to stop claiming the grant is
+    // being consumed, four minutes before the cut-off delay releases it.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({ heaterBindings: NO_POWER_BINDINGS, availableSurplusW: 1500 });
+    const handle = createRecipe().createInstance(
+      // The production meter is what keeps the household witness alive under
+      // sun — and a grant only ever happens under sun.
+      { ...BASE_PARAMS, gridEquipment: METER, productionEquipment: PRODUCTION },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.grant();
+    await advance(1);
+    // Producing 2500, exporting 300: the house draws 2200, i.e. the resistor.
+    h.setBinding(PRODUCTION, "power", 2500);
+    h.setBinding(METER, "power", -300);
+    await advance(30);
+    expect(h.state.get("householdProven")).toBe(true);
+    expect(h.liveClaim()?.needs.at(-1)).toBe(true);
+
+    h.setBinding(METER, "power", -2400); // thermostat opened, all of it exported
+    await advance(2); // past the 1 min declaration confirm, short of cutoffDelay
+
+    expect(h.liveClaim()?.needs.at(-1)).toBe(false);
+    expect(h.state.get("tankFull")).toBeFalsy(); // the release has not fired yet
+    handle.stop();
+  });
+
+  it("restates the declaration on every tick, not only when it changes", async () => {
+    // A revoke drops the declaration with the grant, so a recipe reporting on
+    // transitions alone goes silent across a revoke/re-grant.
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({ initialState: { powerProven: true } });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    // Everything before the grant describes a relay that is still open; the
+    // core ignores a declaration on a pending claim anyway.
+    h.grant();
+    const beforeGrant = h.liveClaim()!.needs.length;
+    await advance(3);
+
+    const declared = h.liveClaim()!.needs.slice(beforeGrant);
+    expect(declared.length).toBeGreaterThan(3); // restated, not edge-triggered
+    expect(declared.every((n) => n === true)).toBe(true);
+    handle.stop();
+  });
+
+  it("heats normally on a core that has no reportNeed", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({ noReportNeed: true });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    h.grant();
+    await advance(1);
+
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("solar");
+    handle.stop();
+  });
+
+  it("survives a core whose reportNeed throws", async () => {
+    at("2026-08-09T13:00:00");
+    const h = buildHarness({ reportNeedThrows: true });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    h.grant();
+    await advance(2);
+
+    // publish() runs after the declaration: a throw that escaped would abort
+    // the tick before this key was written.
+    expect(h.state.get("surplusClaim")).toBe("granted");
+    expect(h.lastOrder()).toMatchObject({ value: true });
     handle.stop();
   });
 

@@ -2303,6 +2303,150 @@ describe("createInstance", () => {
 });
 
 // ============================================================
+// Surplus is asked for a real deficit, not for a cleared latch
+// ============================================================
+
+describe("surplus demand threshold", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * The `tankFull` latch is binary and a single draw clears it — one shower, or
+   * hot water for the dishes. The recipe then reserved its whole rating to top
+   * up a tank at 98 %, closed the relay, and the thermostat opened two minutes
+   * later. On a real installation that happened four times in three days:
+   * "chargé à 100 % au départ ... thermostat coupé après 2 min".
+   *
+   * The model already knows how much energy is missing. These pin that the
+   * demand now follows it.
+   */
+
+  /** Heat a tank to its anchor at 14:00 — outside any off-peak window. */
+  async function anchoredFullTank(h: ReturnType<typeof buildHarness>) {
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70 },
+      h.ctx as never,
+    );
+    await advance(1);
+    // The model is unanchored: the recipe asks, and must ask — a cycle is the
+    // only way to anchor it.
+    h.grant();
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(40);
+    h.setBinding(HEATER, "power", 4); // thermostat opened
+    await advance(6); // cut-off confirmed → anchor, tank full
+    expect(h.state.get("tankCharge")).toBe(100);
+    return handle;
+  }
+
+  it("stops asking once a small draw leaves the tank nearly full", async () => {
+    at("2026-08-10T14:00:00");
+    const h = buildHarness({ availableSurplusW: 3000 });
+    const handle = await anchoredFullTank(h);
+
+    // 3 °C is exactly what clears the latch, and 360 Wh is a quarter of a
+    // shower: the old code asked for 2.2 kW on the strength of it.
+    h.setBinding(HEATER, "water_temperature", 57);
+    await advance(2);
+
+    expect(h.state.get("tankFull")).toBe(false);
+    expect(h.liveClaim()).toBeUndefined();
+    expect(h.state.get("deficitWh") as number).toBeLessThan(
+      h.state.get("surplusMinDeficitWh") as number,
+    );
+    handle.stop();
+  });
+
+  it("says so once, in the journal, rather than leaving a silent afternoon", async () => {
+    at("2026-08-10T14:00:00");
+    const h = buildHarness({ availableSurplusW: 3000 });
+    const handle = await anchoredFullTank(h);
+    h.setBinding(HEATER, "water_temperature", 57);
+    await advance(2);
+
+    const held = h.logLines.filter((l) => l.startsWith("Surplus non demandé"));
+    expect(held).toHaveLength(1);
+    expect(held[0]).toMatch(/il manque \d+ Wh au ballon/);
+
+    // And not again on every tick.
+    await advance(10);
+    expect(h.logLines.filter((l) => l.startsWith("Surplus non demandé"))).toHaveLength(1);
+    handle.stop();
+  });
+
+  it("asks again once the showers add up", async () => {
+    at("2026-08-10T14:00:00");
+    const h = buildHarness({ availableSurplusW: 3000 });
+    const handle = await anchoredFullTank(h);
+
+    h.setBinding(HEATER, "water_temperature", 57);
+    await advance(2);
+    expect(h.liveClaim()).toBeUndefined();
+
+    // A real run of showers: 15 °C off the probe is 1800 Wh on the default
+    // coefficient, past the one-shower threshold.
+    h.setBinding(HEATER, "water_temperature", 42);
+    await advance(2);
+
+    expect(h.liveClaim()).toBeDefined();
+    expect(h.logLines.some((l) => l.startsWith("Surplus demandé à nouveau"))).toBe(true);
+    handle.stop();
+  });
+
+  it("holds a granted cycle to the thermostat, however small the deficit gets", async () => {
+    at("2026-08-10T14:00:00");
+    const h = buildHarness({ availableSurplusW: 3000 });
+    const handle = await anchoredFullTank(h);
+
+    // Draw enough to be asked again, then let the grant land. The wait is the
+    // recipe's own anti-short-cycling floor (MIN_OFF_MS, 10 min, stricter than
+    // the profile's 300 s): without it the ON is refused and the test would be
+    // measuring that instead.
+    h.setBinding(HEATER, "water_temperature", 40);
+    await advance(11);
+    h.grant();
+    await advance(1);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+
+    // The tank fills back through the threshold while heating. Dropping the
+    // grant here would trade the anchor — the one free calibration this recipe
+    // gets — for a few watts.
+    h.setBinding(HEATER, "water_temperature", 59);
+    await advance(20);
+    expect(h.liveClaim()).toBeDefined();
+    handle.stop();
+  });
+
+  it("keeps the old behaviour when the threshold is set to zero", async () => {
+    at("2026-08-10T14:00:00");
+    const h = buildHarness({ availableSurplusW: 3000 });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70, surplusMinShowers: 0 },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.grant();
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(40);
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+    h.setBinding(HEATER, "water_temperature", 57);
+    await advance(2);
+
+    // 0 means "ask whenever the tank is not full", which is what every
+    // instance did before this version.
+    expect(h.liveClaim()).toBeDefined();
+    handle.stop();
+  });
+});
+
+// ============================================================
 // Form shape — what the recipe promises the UI
 // ============================================================
 

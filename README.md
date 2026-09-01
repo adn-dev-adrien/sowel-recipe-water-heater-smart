@@ -160,9 +160,23 @@ La déclaration ne pèse que là où l'arbitre n'a rien mesuré : une installati
 
 Quand le plancher ou le cycle heures creuses ferme le relais, la recette **garde sa réservation ouverte** au lieu de la rendre (règle auteur 5 de la spec). Une charge qui tourne sans réservation est un trou dans le surplus de l'arbitre : il compte ses 2,2 kW comme de la consommation de fond et révoque la pompe piscine sans comprendre pourquoi. Avec la réservation ouverte, l'arbitre peut l'accorder à coût nul — la consommation est déjà dans le compteur — et ses comptes redeviennent justes pour tout le monde.
 
+### On ne demande pas 2,3 kW pour un ballon déjà plein
+
+Le verrou « ballon plein » est binaire, et **un seul puisage le libère** : une douche, ou de l'eau chaude pour la vaisselle. La recette redemandait alors du surplus pour un ballon à 98 %, fermait le relais, et le thermostat s'ouvrait deux minutes plus tard. Sur une installation réelle, quatre fois en trois jours : « ballon déjà chargé à 100 % au départ … thermostat coupé après 2 min ».
+
+Le modèle de charge sait déjà **combien il manque**. Le slot **« Surplus dès »** (groupe *Surplus solaire*, 1 douche par défaut) fixe le déficit minimum, compté en douches — l'unité que le foyer manipule, et une valeur ajustée sur l'historique de ce ballon-là, pas une constante. En dessous, la recette ne réserve rien : les watts restent aux autres charges de la liste de priorité, le relais ne s'use pas, et le chauffe-eau cesse d'apparaître comme un client permanent du surplus.
+
+Trois exceptions, toutes délibérées :
+
+- une **réservation déjà accordée** va jusqu'à la coupure du thermostat : c'est le seul recalage gratuit du modèle, on ne l'échange pas contre quelques watts ;
+- un **relais déjà fermé** par la recette (plancher, heures creuses) garde la réservation ouverte — c'est la règle auteur 5 ci-dessus ;
+- un **modèle non ancré** ne sait pas ce qui manque : tant qu'aucun cycle n'a atteint le thermostat, la recette demande comme avant.
+
+Mettre **0** rend le comportement d'avant : demander dès que le ballon n'est pas plein. La bascule est journalisée une fois, dans les deux sens (« Surplus non demandé : il manque 278 Wh au ballon… »).
+
 ### Ce que publie l'instance
 
-`surplusClaim` (`pending` / `granted` / la raison du refus), `availableSurplus` (le surplus disponible vu par l'arbitre), `surplusSlack` et `surplusDrawing` (ce que la recette a déclaré en dernier à l'arbitre — c'est la différence entre « accordé » et « accordé, à l'arrêt » sur la surface d'arbitrage). Les anciens `surplus`, `solarStartAt` et `solarStopAt` ont disparu avec les seuils : « pourquoi ça ne chauffe pas en plein soleil ? » se lit maintenant sur une ligne, et le détail complet est dans le journal des décisions de **Énergie → En direct**.
+`surplusClaim` (`pending` / `granted` / la raison du refus), `deficitWh` et `surplusMinDeficitWh` (ce qui manque au ballon, et à partir de quand ça vaut une demande), `availableSurplus` (le surplus disponible vu par l'arbitre), `surplusSlack` et `surplusDrawing` (ce que la recette a déclaré en dernier à l'arbitre — c'est la différence entre « accordé » et « accordé, à l'arrêt » sur la surface d'arbitrage). Les anciens `surplus`, `solarStartAt` et `solarStopAt` ont disparu avec les seuils : « pourquoi ça ne chauffe pas en plein soleil ? » se lit maintenant sur une ligne, et le détail complet est dans le journal des décisions de **Énergie → En direct**.
 
 ## Modes
 

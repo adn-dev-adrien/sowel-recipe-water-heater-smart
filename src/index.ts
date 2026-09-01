@@ -957,6 +957,16 @@ function buildSlots(): RecipeSlotDef[] {
       group: "advanced",
     },
     {
+      id: "surplusMinShowers",
+      name: "Surplus from",
+      description: "Showers missing",
+      type: "number",
+      required: false,
+      defaultValue: 1,
+      constraints: { min: 0, max: 5 },
+      group: "solar",
+    },
+    {
       id: "gridEquipment",
       name: "House meter",
       description: "Cut-off fallback",
@@ -1090,6 +1100,10 @@ const FR: RecipeLangPack = {
       name: "Soutirage OK",
       description: "Vide = 10 % charge",
     },
+    surplusMinShowers: {
+      name: "Surplus d\u00e8s",
+      description: "Douches manquantes",
+    },
     tempMaxAge: {
       name: "Sonde p\u00e9rim\u00e9e",
       description: "Au-del\u00e0, ignor\u00e9e",
@@ -1140,6 +1154,7 @@ const FR: RecipeLangPack = {
     floor: "Chauffe de secours (plus d'eau chaude)",
     hc: "Heures creuses",
     tank: "Mod\u00e8le de charge du ballon",
+    solar: "Surplus solaire",
     cutoff: "D\u00e9tection de coupure sans mesure d\u00e9di\u00e9e",
     advanced: "R\u00e9glages avanc\u00e9s",
   },
@@ -1359,6 +1374,8 @@ export function createRecipe(): RecipeDefinition {
       const fullCycleEveryDays = toNumber(params.fullCycleEveryDays) ?? 7;
 
       const tankVolumeL = toNumber(params.tankVolume) ?? 200;
+      /** Showers' worth of missing energy before the recipe asks for surplus. */
+      const surplusMinShowers = Math.max(0, Math.min(5, toNumber(params.surplusMinShowers) ?? 1));
       const standbyW = toNumber(params.standbyPower) ?? 70;
       const cutoffPower = toNumber(params.cutoffPower) ?? 300;
       const cutoffDelayMs = ctx.helpers.parseDuration(params.cutoffDelay ?? "5m");
@@ -1449,6 +1466,8 @@ export function createRecipe(): RecipeDefinition {
       let claimSlack: CapacitySlack | null = null;
       /** Spec 166: last value handed to the arbiter, for the status line. */
       let lastReportedNeed: boolean | null = null;
+      /** True while the claim is withheld because the tank barely needs energy. */
+      let surplusHeld = false;
       /** A core whose handle throws is worth saying once, not every 30 s. */
       let reportNeedFailed = false;
       /** Set by the arbiter's callbacks. The *only* solar input this recipe has. */
@@ -1923,8 +1942,51 @@ export function createRecipe(): RecipeDefinition {
        * arbiter's surplus, and a grant landing on it costs nothing and makes
        * the books exact for everyone else in the priority list.
        */
+      /** Energy the tank is missing to be full, per the model, in Wh. */
+      function deficitWh(): number {
+        return Math.max(0, tankCapacityWh(tankVolumeL, tank) - tank.storedWh);
+      }
+
+      /**
+       * How empty the tank must be before free watts are worth reserving.
+       *
+       * Counted in showers because that is the unit the household thinks in,
+       * and because `showerWh` is fitted from this tank's own history rather
+       * than assumed.
+       */
+      function surplusMinDeficitWh(): number {
+        return surplusMinShowers * tank.showerWh;
+      }
+
       function wantsCapacity(s: Snapshot): boolean {
-        return mode !== "off" && !isTankFull(s.temp, s.now);
+        if (mode === "off") return false;
+        if (isTankFull(s.temp, s.now)) return false;
+
+        // A cycle already granted runs to its end: the thermostat opening is
+        // what anchors the model, and dropping the grant a few Wh short would
+        // trade that anchor for nothing.
+        //
+        // A relay this recipe is driving keeps the claim too, whatever the
+        // deficit: that is author rule 5 — a load consuming outside the
+        // arbiter's books is a hole in everyone else's surplus, and the
+        // off-peak top-up draws 2.3 kW like any other cycle.
+        if (claim?.status() === "granted" || relayOn) return true;
+
+        // The `tankFull` latch is binary, and a single draw clears it — one
+        // shower, or hot water for the dishes. Without this the recipe then
+        // reserved 2.3 kW to top up a tank at 98 %, closed the relay, and the
+        // thermostat opened two minutes later: watts held back from the rest
+        // of the priority list, relay wear, and a load that reads as a
+        // permanent client of the surplus. The model already knows how much is
+        // actually missing, and below one shower's worth nothing is worth
+        // asking for.
+        //
+        // Skipped while the model is unanchored: its deficit is a guess then,
+        // and the way to anchor it is to let a cycle reach the thermostat.
+        if (surplusMinShowers > 0 && tank.anchored && deficitWh() < surplusMinDeficitWh()) {
+          return false;
+        }
+        return true;
       }
 
       /** A core that answers badly must not take the recipe down with it. */
@@ -1959,7 +2021,26 @@ export function createRecipe(): RecipeDefinition {
         const energy = ctx.helpers.energy;
         if (!energy) return;
 
-        if (!wantsCapacity(s)) {
+        const wants = wantsCapacity(s);
+
+        // Say it once, on the transition. "Off" and "tank full" already speak
+        // for themselves in the journal; what needed a line is the third case,
+        // where the tank is not full and the recipe still asks for nothing —
+        // otherwise a sunny afternoon with no heating is unexplainable.
+        const held = !wants && mode !== "off" && !isTankFull(s.temp, s.now);
+        if (held !== surplusHeld) {
+          surplusHeld = held;
+          const missing = Math.round(deficitWh());
+          ctx.log(
+            held
+              ? `Surplus non demandé : il manque ${missing} Wh au ballon, moins de ${surplusMinShowers} douche${
+                  surplusMinShowers > 1 ? "s" : ""
+                } (${Math.round(surplusMinDeficitWh())} Wh)`
+              : `Surplus demandé à nouveau : il manque ${missing} Wh au ballon`,
+          );
+        }
+
+        if (!wants) {
           if (claim) {
             claim.release();
             claim = null;
@@ -2528,6 +2609,10 @@ export function createRecipe(): RecipeDefinition {
             ? Math.round((tank.storedWh / capacityWh) * 100)
             : null;
         ctx.state.set("tankCharge", charge);
+        // What the surplus demand is judged on (and what it would take to
+        // revive it), so the decision is readable without the source.
+        ctx.state.set("deficitWh", Math.round(deficitWh()));
+        ctx.state.set("surplusMinDeficitWh", Math.round(surplusMinDeficitWh()));
 
         // The card's one free line (state.summary). It is the only place the
         // observer is visible without an API call, so it carries the model and
@@ -2675,7 +2760,10 @@ export function createRecipe(): RecipeDefinition {
             ? "surplus indisponible (chauffe-eau non déclaré comme charge pilotable)"
             : capacity?.enabled === false
               ? "surplus indisponible (arbitrage désactivé)"
-              : `surplus arbitré par Sowel (${heaterPower()} W, soutirage toléré ${effectiveToleratedImportW()} W)`,
+              : `surplus arbitré par Sowel (${heaterPower()} W, soutirage toléré ${effectiveToleratedImportW()} W` +
+                (surplusMinShowers > 0
+                  ? `, demandé à partir de ${surplusMinShowers} douche${surplusMinShowers > 1 ? "s" : ""} manquante${surplusMinShowers > 1 ? "s" : ""})`
+                  : ")"),
       ].join(", ");
       ctx.log(
         `Recette démarrée sur ${heaterName} — HC ${

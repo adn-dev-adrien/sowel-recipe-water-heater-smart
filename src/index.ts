@@ -311,6 +311,11 @@ const DRAW_OFF_DELTA_C = 3;
  * The asymmetry is deliberate: concluding "full" wrongly leaves the household
  * without hot water, while refusing to conclude only leaves a relay closed on
  * a circuit that is drawing nothing.
+ *
+ * The same ratio, applied to the *running* cycle, separates the two things a
+ * cut-off used to mean at once — see `markTankFull`. A cycle that never pulled
+ * proves the thermostat is open; only a cycle that pulled and then collapsed
+ * proves the tank reached its setpoint.
  */
 const CUTOFF_MIN_PEAK_RATIO = 0.5;
 
@@ -552,13 +557,32 @@ export interface TankModel {
 const WH_PER_LITRE_KELVIN = 1.163;
 
 /**
- * Probe fall between two samples that means a draw rather than cooling.
+ * Opening a draw on the probe: a *rate*, not a step.
  *
- * The separation is wide enough not to be a tuning knob: measured showers move
- * the probe 1.6–4.0 °C between samples, standing loss moves it 0.22 °C per
- * hour. Anything gentler is the tank cooling, and the standby term has it.
+ * The first version tested the fall between two consecutive samples against
+ * 1 °C, which silently made the detection a function of the sensor's reporting
+ * cadence. Measured on this tank: the probe reports every ~300 s while idle but
+ * every ~60 s as soon as it moves, so a real draw arrives as a long run of
+ * 0.4–0.6 °C steps — every one of them under the bar. Over the evening of
+ * 2026-09-02 that classified 21 °C of collapse out of 36 as "cooling", and the
+ * tank ran out mid-shower with the model still reading 96 %.
+ *
+ * Rate separates them by a factor of twenty and does not care about the
+ * cadence: measured draws run 0.12–1.3 °C/min, standing loss 0.008 °C/min
+ * (4.2 °C over the nine idle hours of 2026-09-02).
  */
-const DRAW_TICK_DROP_C = 1;
+const DRAW_OPEN_RATE_C_PER_MIN = 0.1;
+/** …with a floor of two quantisation steps, so the probe's own 0.2 °C
+ *  resolution cannot open a draw on its own at a 60 s cadence. */
+const DRAW_OPEN_DROP_C = 0.4;
+/**
+ * Once open, a draw bills every fall until the probe has held still this long.
+ *
+ * The tail of a collapse is slow — the last degrees arrive in 0.2 °C steps
+ * minutes apart — and it is real energy. Requiring each of them to re-qualify
+ * on rate is what let the tail escape in the first place.
+ */
+const DRAW_IDLE_MS = 10 * 60 * 1000;
 
 /**
  * A cycle only teaches the off-peak duration if it started from a tank that
@@ -615,6 +639,46 @@ export function showersFromRise(durationMin: number): number {
 /** Starting guess for `drawWhPerC`, replaced by the first calibration. */
 export const DEFAULT_DRAW_WH_PER_C = 120;
 
+/**
+ * A shower billed from humidity is only charged for what the probe did not
+ * already see, within this much of the rise.
+ *
+ * The two detectors watch the same event through different instruments and the
+ * humidity lags: the collapse of 2026-09-02 21:37 was over by 21:47, and the
+ * bathroom's rise did not close until 23:17. Billing both would have charged
+ * that shower twice. Anything inside the window is taken to be the same water.
+ */
+const PROBE_DEBIT_MATCH_MS = 90 * 60 * 1000;
+
+/**
+ * How far the model may sit above what the probe can justify.
+ *
+ * A probe low in the tank reads far below the mean — that is the whole reason
+ * the balance is kept in energy. But the gap is bounded, and a model that has
+ * drifted past the bound is simply wrong. Measured on the five cold-start
+ * nights of 2026-08-25…29 plus 09-01…03, the distance between the probe's own
+ * fraction of the span and the charge the following cycle proved was 10 to 26
+ * points. Thirty-five leaves margin on the worst of them and still caught the
+ * 2026-09-02 evening, where the model read 96 % on a tank the probe put at 8 %.
+ *
+ * This is a guard rail, not a measurement: it only ever pulls the model down.
+ */
+const PROBE_CAP_MARGIN = 0.35;
+
+/**
+ * How fast `fullC` may follow a cut-off that reads lower than the last one.
+ *
+ * The tank's full temperature is a hardware setpoint; it does not move night to
+ * night. The probe's *reading* of it does, because the probe is loosely coupled
+ * and lags — this installation cut off at 64.2 °C on 2026-08-27 and at 61.8 °C
+ * on 2026-09-03 for the same setpoint. Taking every reading at face value
+ * ratchets `fullC` down, which shrinks the modelled capacity, which makes an
+ * emptying tank look fuller: 64 → 61.2 → 57 °C in three days. Rising readings
+ * are adopted at once; falling ones creep, so a real setpoint change still
+ * converges in a fortnight while one stratified cycle cannot rewrite the tank.
+ */
+const FULL_C_DECAY_C = 0.5;
+
 /** Bounds on the fitted coefficient — a bad night must not wreck the model. */
 const DRAW_COEFF_MIN = 20;
 const DRAW_COEFF_MAX = 600;
@@ -650,18 +714,52 @@ export function applyEnergy(
 }
 
 /**
- * The free anchor: the thermostat opened, so the tank is uniformly at its
- * setpoint. Stored energy is capacity by definition and the drift is dropped.
- * The reading also *is* the full temperature, so it retrains `fullC`.
+ * The free anchor: the resistor was pulling, then stopped on its own, so the
+ * thermostat reached its setpoint and the tank is full. Stored energy is
+ * capacity by definition and the drift is dropped. The reading also *is* the
+ * full temperature, so it retrains `fullC` — upwards at once, downwards slowly.
+ *
+ * Only ever called for a cycle that actually drew current. A relay closed onto
+ * an already-open thermostat says the tank is hot, not that it is full, and
+ * anchoring on it is what erased a whole morning's deficit on 2026-09-02.
  */
 export function anchorOnCutoff(
   model: TankModel,
   volumeL: number,
   probeC: number | null,
 ): TankModel {
-  const fullC = probeC !== null && probeC > model.coldC ? probeC : model.fullC;
+  const fullC =
+    probeC === null || probeC <= model.coldC
+      ? model.fullC
+      : probeC >= model.fullC
+        ? probeC
+        : Math.max(probeC, model.fullC - FULL_C_DECAY_C);
   const next: TankModel = { ...model, fullC, anchored: true };
   return { ...next, storedWh: tankCapacityWh(volumeL, next) };
+}
+
+/**
+ * Pull the model down to what the probe can justify. Never up.
+ *
+ * The probe under-reads the mean, so it cannot say how full the tank is — but
+ * it does put a ceiling on it, and a model above that ceiling has drifted.
+ * Returns the model unchanged when there is nothing to say: no reading, no
+ * anchor yet, or a span too small to divide by.
+ */
+export function capOnProbe(
+  model: TankModel,
+  volumeL: number,
+  probeC: number | null,
+): TankModel {
+  if (!model.anchored || probeC === null) return model;
+  const span = model.fullC - model.coldC;
+  if (span <= 0) return model;
+  const capacityWh = tankCapacityWh(volumeL, model);
+  if (capacityWh <= 0) return model;
+  const probeFraction = (probeC - model.coldC) / span;
+  const ceiling = capacityWh * Math.min(1, Math.max(0, probeFraction) + PROBE_CAP_MARGIN);
+  if (model.storedWh <= ceiling) return model;
+  return { ...model, storedWh: ceiling };
 }
 
 /** The coldest reading ever seen is the inlet temperature, learned for free. */
@@ -1420,6 +1518,9 @@ export function createRecipe(): RecipeDefinition {
 
       let lowPowerSince: number | null = null;
       let cyclePeakPower = 0;
+      /** Same, for the household fallback: the peak the total reached during
+       *  this cycle, which is what separates "it heated" from "it never did". */
+      let cycleHouseholdPeak = 0;
       /** Persisted: the power channel has been seen carrying the heater's draw. */
       let powerProven = false;
       /** Same idea for the household total, when it is the only witness. */
@@ -1435,8 +1536,10 @@ export function createRecipe(): RecipeDefinition {
         showerWh: DEFAULT_SHOWER_WH,
         anchored: false,
       };
-      /** Probe reading at the previous tick — draws are read from its drops. */
+      /** Last probe reading that actually differed, and when it arrived. Draws
+       *  are read from the rate between two *changes*, not between two ticks. */
       let lastProbeC: number | null = null;
+      let lastProbeAt: number | null = null;
       /** Wall clock of the previous observer update, for the energy integral. */
       let lastModelAt: number | null = null;
       /** Stored energy when the running cycle began — the calibration target. */
@@ -1450,6 +1553,29 @@ export function createRecipe(): RecipeDefinition {
       const lastHumidity = new Map<string, number>();
       /** Showers counted since the last anchor — published, and fitted on it. */
       let showersSinceAnchor = 0;
+      /**
+       * The draw currently being read off the probe: opened on a fall fast
+       * enough to be water rather than weather, and kept open through the slow
+       * tail. `null` between draws.
+       */
+      let drawLastFallAt: number | null = null;
+      /** Probe temperature when the running draw opened, for one clean log. */
+      let drawFromC: number | null = null;
+      /** Energy the running draw has billed, for that same log. */
+      let drawWh = 0;
+      /**
+       * Recent probe debits, so a shower detected later from humidity is only
+       * charged for what the probe did not already see. Pruned to
+       * `PROBE_DEBIT_MATCH_MS`; a handful of entries at most.
+       */
+      const probeDebits: Array<{ at: number; wh: number }> = [];
+      /** Which detector carried the deficit since the last anchor — the
+       *  calibration fits whichever of the two actually did the work. */
+      let billedByProbeWh = 0;
+      let billedByShowersWh = 0;
+      /** Last time the probe ceiling pulled the model down, to log it once per
+       *  drift rather than on every tick. */
+      let lastCapNoticeAt = 0;
       let mismatchSince: number | null = null;
       let manualOn = false;
 
@@ -1595,15 +1721,52 @@ export function createRecipe(): RecipeDefinition {
         disabled: "arbitrage désactivé",
       };
 
-      /** `endedAt` is when the resistor actually stopped drawing — i.e. when the
-       *  power collapsed, not when we finished confirming it. Feeding the
-       *  detection delay into the learner would inflate every estimate by
-       *  `cutoffDelay` and drift the off-peak placement earlier each night. */
-      function markTankFull(temp: number | null, now: number, endedAt: number = now): void {
+      /**
+       * `endedAt` is when the resistor actually stopped drawing — i.e. when the
+       * power collapsed, not when we finished confirming it. Feeding the
+       * detection delay into the learner would inflate every estimate by
+       * `cutoffDelay` and drift the off-peak placement earlier each night.
+       *
+       * `drew` says whether the resistor pulled at all during this cycle, and it
+       * splits what used to be one conclusion into the two different facts it
+       * always was:
+       *
+       *   - the thermostat is **open** — true either way, and all the latch
+       *     needs. It is what keeps the recipe from heating a hot tank, so it
+       *     still applies to a cycle that never drew a watt;
+       *   - the tank is **full** — only true if the resistor was pulling and
+       *     stopped by itself. A thermostat has several degrees of differential:
+       *     it stays open all the way down to its reset point, so a relay closed
+       *     onto an open thermostat proves "hot", never "at setpoint".
+       *
+       * Conflating them cost a whole day of hot water on 2026-09-02: a surplus
+       * cycle closed the relay at 11:24 on a tank the probe put at 57 °C, no
+       * current flowed, and the recipe rewrote the model to 100 % and dragged
+       * `fullC` from 61.2 down to 57. Four draws later it still read 96 %, the
+       * evening shower ran cold, and nothing had asked for a single watt.
+       */
+      function markTankFull(
+        temp: number | null,
+        now: number,
+        endedAt: number = now,
+        drew: boolean = true,
+      ): void {
         tankFull = true;
         tankFullAt = now;
         tankFullTemp = temp;
         lastFullCycleAt = now;
+
+        // A thermostat that was already open when we closed the relay teaches
+        // nothing about capacity, duration or coefficients. Latch, say so, stop.
+        if (!drew) {
+          const held = cycleStartedAt !== null ? Math.round((endedAt - cycleStartedAt) / 60000) : 0;
+          ctx.log(
+            `Thermostat déjà ouvert (relais fermé ${held} min sans consommation) — ballon chaud, modèle inchangé`,
+          );
+          storedAtCycleStart = null;
+          persist();
+          return;
+        }
 
         // Read before anchoring: the anchor overwrites both of these.
         const capacityAtStart = tankCapacityWh(tankVolumeL, tank);
@@ -1615,12 +1778,33 @@ export function createRecipe(): RecipeDefinition {
         // The free anchor. Fit the draw coefficient against what this cycle
         // actually had to deliver, THEN discard the drift — in that order, or
         // the evidence is erased before it is used.
-        if (cycleStartedAt !== null && storedAtCycleStart !== null) {
+        //
+        // Two cycles carry no evidence at all and must not be fitted on:
+        //
+        //   - the model had no origin when the cycle started (`chargeAtStart`
+        //     null), so "the deficit it should have predicted" is not a
+        //     quantity. The very first anchor used to collapse the coefficient
+        //     from 120 to 88 Wh/°C on this basis alone;
+        //   - nothing was billed since the last anchor, so the residual is
+        //     standing loss and rounding, and the ratio is pure noise.
+        //
+        // The bookkeeping is reset either way: it covers the span between two
+        // anchors, not between two calibrations.
+        const billedWh = billedByProbeWh + billedByShowersWh;
+        if (
+          cycleStartedAt !== null &&
+          storedAtCycleStart !== null &&
+          chargeAtStart !== null &&
+          billedWh > 0
+        ) {
           const hours = Math.max(0, endedAt - cycleStartedAt) / 3_600_000;
           const deliveredWh = Math.max(0, heaterPower() * hours - standbyW * hours);
-          // One nightly scalar fits one coefficient, so fit the one that is
-          // actually carrying the draws on this install.
-          const usingShowers = bathroomIds.length > 0;
+          // One nightly scalar fits one coefficient, so fit the one that
+          // actually carried the draws since the last anchor — not the one the
+          // install happens to have wired. Fitting by wiring is how `showerWh`
+          // came to absorb the error of three draws no bathroom ever saw, while
+          // the coefficient that had billed them went untouched.
+          const usingShowers = billedByShowersWh > billedByProbeWh;
           const before = usingShowers ? tank.showerWh : tank.drawWhPerC;
           const fitted = calibrateDrawCoefficient(
             before,
@@ -1631,11 +1815,18 @@ export function createRecipe(): RecipeDefinition {
           tank = usingShowers ? { ...tank, showerWh: fitted } : { ...tank, drawWhPerC: fitted };
           if (fitted !== before) {
             ctx.log(
-              `Modèle recalé : ${Math.round(deliveredWh)} Wh restitués sur ${showersSinceAnchor} douche${showersSinceAnchor > 1 ? "s" : ""} — ${usingShowers ? "coût d'une douche" : "coefficient de puisage"} ${before} → ${fitted}`,
+              `Modèle recalé : ${Math.round(deliveredWh)} Wh restitués — ${
+                usingShowers
+                  ? `coût d'une douche ${before} → ${fitted} Wh (${showersSinceAnchor} douche${showersSinceAnchor > 1 ? "s" : ""} facturée${showersSinceAnchor > 1 ? "s" : ""})`
+                  : `coefficient de puisage ${before} → ${fitted} Wh/°C (${Math.round(billedByProbeWh)} Wh lus sur la sonde)`
+              }`,
             );
           }
-          showersSinceAnchor = 0;
         }
+        showersSinceAnchor = 0;
+        billedByProbeWh = 0;
+        billedByShowersWh = 0;
+        probeDebits.length = 0;
         tank = anchorOnCutoff(tank, tankVolumeL, temp);
         storedAtCycleStart = null;
 
@@ -2240,6 +2431,7 @@ export function createRecipe(): RecipeDefinition {
           lowPowerSince = null;
           householdLowSince = null;
           cyclePeakPower = 0;
+          cycleHouseholdPeak = 0;
           ctx.log(`Chauffe démarrée (${REASON_FR[desired]})`);
           return;
         }
@@ -2300,6 +2492,7 @@ export function createRecipe(): RecipeDefinition {
           cycleStartedAt = null;
           lowPowerSince = null;
           cyclePeakPower = 0;
+          cycleHouseholdPeak = 0;
           offSince = s.now;
           ctx.log(`Chauffe arrêtée (${previous ? REASON_FR[previous] : "?"})`);
           return;
@@ -2368,6 +2561,7 @@ export function createRecipe(): RecipeDefinition {
         if (s.household === null) return;
 
         const declared = heaterPower();
+        if (s.household > cycleHouseholdPeak) cycleHouseholdPeak = s.household;
         if (s.household >= declared * HOUSEHOLD_PROVEN_RATIO && !householdProven) {
           householdProven = true;
           ctx.state.set("householdProven", true);
@@ -2389,12 +2583,18 @@ export function createRecipe(): RecipeDefinition {
         if (s.now - householdLowSince >= cutoffDelayMs) {
           const collapsedAt = householdLowSince;
           householdLowSince = null;
-          ctx.log(
-            `Ballon plein déduit de la consommation totale (${Math.round(
-              s.household,
-            )} W < ${declared} W déclarés, relais fermé)`,
-          );
-          markTankFull(s.temp, s.now, collapsedAt);
+          // Same distinction as on a dedicated channel: a total that never rose
+          // to the heater's declared power during this cycle means the
+          // thermostat was open the whole time, not that the tank just filled.
+          const drew = cycleHouseholdPeak >= declared * HOUSEHOLD_PROVEN_RATIO;
+          if (drew) {
+            ctx.log(
+              `Ballon plein déduit de la consommation totale (${Math.round(
+                s.household,
+              )} W < ${declared} W déclarés, relais fermé)`,
+            );
+          }
+          markTankFull(s.temp, s.now, collapsedAt, drew);
         }
       }
 
@@ -2402,10 +2602,19 @@ export function createRecipe(): RecipeDefinition {
        * Advance the charge observer one tick. Decides nothing — it only keeps
        * the energy balance so the model can be judged before it is trusted.
        *
-       * A draw is read as a *fast* fall of the probe. The separation is wide:
-       * a shower moves it 1.6–4.0 °C between two samples, standing loss moves
-       * it 0.22 °C per hour. Anything slower than the threshold is the tank
-       * cooling, which the standby term already accounts for.
+       * Three terms and a guard rail:
+       *
+       *   - standing loss and, while the relay is closed, the resistor;
+       *   - draws read off the probe, opened on a *rate* and billed to the end
+       *     of their tail. This runs whether or not bathrooms are wired: the
+       *     humidity is the only witness once the probe has saturated at the
+       *     inlet, but until then the probe is the earlier and far more precise
+       *     of the two, and muting it is what let four draws through unbilled
+       *     on 2026-09-02;
+       *   - showers from humidity, in `detectShowers`, charged only for what the
+       *     probe did not already see;
+       *   - and last, the probe ceiling: whatever the balance believes, it may
+       *     not sit further above the probe than a stratified tank can explain.
        */
       function updateModel(s: Snapshot): void {
         tank = learnColdInlet(tank, s.temp);
@@ -2415,22 +2624,92 @@ export function createRecipe(): RecipeDefinition {
           const hours = Math.max(0, s.now - lastModelAt) / 3_600_000;
           if (hours > 0 && hours < 6) {
             let deltaWh = -standbyW * hours;
-            if (relayOn) deltaWh += heaterPower() * hours;
+            // A closed relay is not a heating tank. Where the channel has been
+            // proven on this heater, credit what it actually reads: the relay
+            // spends real minutes closed onto an open thermostat, and the
+            // declared power credited through them is energy the tank never
+            // received — 274 Wh of it in seven minutes on 2026-09-02.
+            if (relayOn) {
+              deltaWh += (powerProven && s.power !== null ? s.power : heaterPower()) * hours;
+            }
             tank = applyEnergy(tank, capacity, deltaWh);
           }
+        }
 
-          // With bathrooms wired the showers ARE the draw signal; charging the
-          // probe collapse as well would bill the first shower twice.
-          if (bathroomIds.length === 0 && s.temp !== null && lastProbeC !== null) {
+        // The probe, on its own cadence: only a reading that actually changed
+        // carries information, and the interval between changes is what the
+        // rate must be measured over. Measuring it over the tick instead makes
+        // the threshold a function of how chatty the sensor happens to be.
+        if (s.temp !== null && capacity > 0) {
+          if (lastProbeC === null || lastProbeAt === null) {
+            lastProbeC = s.temp;
+            lastProbeAt = s.now;
+          } else if (s.temp !== lastProbeC) {
             const drop = lastProbeC - s.temp;
-            if (drop >= DRAW_TICK_DROP_C) {
-              tank = applyEnergy(tank, capacity, -tank.drawWhPerC * drop);
+            const minutes = Math.max(1 / 60, (s.now - lastProbeAt) / 60000);
+            const open = drawLastFallAt !== null && s.now - drawLastFallAt < DRAW_IDLE_MS;
+            const opens = drop >= DRAW_OPEN_DROP_C && drop / minutes >= DRAW_OPEN_RATE_C_PER_MIN;
+            if (drop > 0 && (open || opens)) {
+              if (!open) {
+                drawFromC = lastProbeC;
+                drawWh = 0;
+              }
+              const wh = tank.drawWhPerC * drop;
+              tank = applyEnergy(tank, capacity, -wh);
+              probeDebits.push({ at: s.now, wh });
+              billedByProbeWh += wh;
+              drawWh += wh;
+              drawLastFallAt = s.now;
             }
+            lastProbeC = s.temp;
+            lastProbeAt = s.now;
+          }
+        }
+
+        // A draw that has stopped moving is over — one line, once, with what it
+        // cost. Per-tick logging of the same collapse would bury the journal.
+        if (drawLastFallAt !== null && s.now - drawLastFallAt >= DRAW_IDLE_MS) {
+          if (drawFromC !== null && drawWh > 0) {
+            ctx.log(
+              `Puisage terminé — sonde ${drawFromC.toFixed(1)} → ${(lastProbeC ?? drawFromC).toFixed(1)} °C, ${Math.round(drawWh)} Wh retirés du modèle`,
+            );
+          }
+          drawLastFallAt = null;
+          drawFromC = null;
+          drawWh = 0;
+        }
+
+        while (probeDebits.length > 0 && s.now - probeDebits[0]!.at > PROBE_DEBIT_MATCH_MS) {
+          probeDebits.shift();
+        }
+
+        // The guard rail. It only ever pulls down, and it says so when it does:
+        // a model corrected in silence is a model whose drift nobody notices.
+        //
+        // Not while the tank-full latch holds. The latch means the thermostat
+        // itself said the tank is hot, which is harder evidence than anything
+        // the probe can offer — and the probe reading at a cut-off is routinely
+        // several degrees below `fullC` on a loosely coupled sensor, so capping
+        // there would spend every cycle undoing the anchor it just took. The
+        // latch clears on the first draw, which is exactly when drift can start.
+        if (capacity > 0 && !tankFull) {
+          const before = tank.storedWh;
+          tank = capOnProbe(tank, tankVolumeL, s.temp);
+          if (
+            tank.storedWh < before - 1 &&
+            s.now - lastCapNoticeAt > PROBE_DEBIT_MATCH_MS
+          ) {
+            lastCapNoticeAt = s.now;
+            ctx.log(
+              `Modèle plafonné par la sonde (${(s.temp as number).toFixed(1)} °C) — charge ramenée de ${Math.round(
+                (before / capacity) * 100,
+              )} % à ${Math.round((tank.storedWh / capacity) * 100)} %`,
+              "warn",
+            );
           }
         }
 
         lastModelAt = s.now;
-        if (s.temp !== null) lastProbeC = s.temp;
       }
 
       /**
@@ -2471,9 +2750,25 @@ export function createRecipe(): RecipeDefinition {
           const minutes = Math.max(0, open.lastUpAt - open.startedAt) / 60000;
           const showers = showersFromRise(minutes);
           showersSinceAnchor += showers;
-          if (capacity > 0) tank = applyEnergy(tank, capacity, -showers * tank.showerWh);
+          // The two detectors watch the same water. Charge the humidity only
+          // for what the probe missed over the same stretch of evening —
+          // usually everything, once the probe has saturated at the inlet, and
+          // usually nothing when it was still free to fall.
+          const claimedWh = showers * tank.showerWh;
+          const seenByProbeWh = probeDebits
+            .filter((d) => d.at >= open.startedAt - PROBE_DEBIT_MATCH_MS && d.at <= s.now)
+            .reduce((sum, d) => sum + d.wh, 0);
+          const billedWh = Math.max(0, claimedWh - seenByProbeWh);
+          if (capacity > 0 && billedWh > 0) {
+            tank = applyEnergy(tank, capacity, -billedWh);
+            billedByShowersWh += billedWh;
+          }
           ctx.log(
-            `${showers} douche${showers > 1 ? "s" : ""} détectée${showers > 1 ? "s" : ""} — ${nameOf(id)}, humidité +${Math.round(open.peak - open.from)} pts sur ${Math.round(minutes)} min`,
+            `${showers} douche${showers > 1 ? "s" : ""} détectée${showers > 1 ? "s" : ""} — ${nameOf(id)}, humidité +${Math.round(open.peak - open.from)} pts sur ${Math.round(minutes)} min${
+              billedWh < claimedWh
+                ? ` ; ${Math.round(billedWh)} Wh facturés, le reste déjà lu sur la sonde`
+                : ` ; ${Math.round(billedWh)} Wh facturés`
+            }`,
           );
         }
       }
@@ -2483,6 +2778,7 @@ export function createRecipe(): RecipeDefinition {
           lowPowerSince = null;
           householdLowSince = null;
           cyclePeakPower = 0;
+          cycleHouseholdPeak = 0;
           return;
         }
         if (s.power === null) {
@@ -2511,7 +2807,13 @@ export function createRecipe(): RecipeDefinition {
         if (s.now - lowPowerSince >= cutoffDelayMs) {
           const collapsedAt = lowPowerSince;
           lowPowerSince = null;
-          markTankFull(s.temp, s.now, collapsedAt);
+          // Did the resistor pull during *this* cycle? `powerProven` cannot
+          // answer that — it is a latch on the channel, set once and true
+          // forever after. Only the running cycle's own peak separates "the
+          // thermostat opened under load" from "the thermostat was already
+          // open when we closed the relay".
+          const drew = cyclePeakPower >= heaterPower() * CUTOFF_MIN_PEAK_RATIO;
+          markTankFull(s.temp, s.now, collapsedAt, drew);
         }
       }
 
@@ -2614,19 +2916,30 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("deficitWh", Math.round(deficitWh()));
         ctx.state.set("surplusMinDeficitWh", Math.round(surplusMinDeficitWh()));
 
-        // The card's one free line (state.summary). It is the only place the
-        // observer is visible without an API call, so it carries the model and
-        // the probe side by side — the whole point being that they disagree.
-        const meanC = modelMeanC(tankVolumeL, tank);
+        // The card's one free line (state.summary). Now that the probe caps the
+        // model rather than merely sitting next to it, the useful pairing is no
+        // longer "model vs probe" but "how full, and how much is missing" — the
+        // second being the number every decision here is actually taken on.
+        //
         // No equivalent-litres figure. It reads as "four showers left" because
         // it assumes perfect stratification; the tank is mixed enough that a
-        // 47 °C mean gave a cold shower while that number said 191 L.
+        // 47 °C mean gave a cold shower while that number said 191 L. Showers
+        // are honest about their own precision: `showerWh` is fitted from this
+        // tank's history, and the unit is what the household thinks in.
+        const missingWh = deficitWh();
+        const missingShowers = tank.showerWh > 0 ? missingWh / tank.showerWh : 0;
+        const probePart = s.temp !== null ? ` · sonde ${s.temp.toFixed(0)} °C` : "";
         ctx.state.set(
           "summary",
-          charge === null || meanC === null
+          charge === null
             ? "Modèle de charge : en attente du premier ancrage"
-            : `Charge ${charge} % · modèle ${meanC.toFixed(0)} °C` +
-              (s.temp !== null ? ` / sonde ${s.temp.toFixed(0)} °C` : ""),
+            : missingShowers < 0.5
+              ? `Ballon chaud · charge ${charge} %${probePart}`
+              : `Charge ${charge} % · il manque ${
+                  missingShowers < 1.5
+                    ? "1 douche"
+                    : `${Math.round(missingShowers)} douches`
+                }${probePart}`,
         );
         ctx.state.set("status", relayOn ? "heating" : manualOn ? "manual" : "off");
         ctx.state.set("reason", reason);

@@ -5,6 +5,7 @@ import {
   modelHotLitres,
   applyEnergy,
   anchorOnCutoff,
+  capOnProbe,
   learnColdInlet,
   calibrateDrawCoefficient,
   showersFromRise,
@@ -28,6 +29,7 @@ const HEATER = "heater-1";
 const METER = "meter-1";
 const PRODUCTION = "production-1";
 const FORECAST = "forecast-1";
+const BATHROOM = "bathroom-1";
 
 type Binding = {
   alias: string;
@@ -165,6 +167,14 @@ function buildHarness(opts: HarnessOptions = {}) {
       type: "energy_production_meter",
       status: "online",
       dataBindings: [{ alias: "power", category: "power", value: 0 }] as Binding[],
+      orderBindings: [],
+    },
+    [BATHROOM]: {
+      id: BATHROOM,
+      name: "Salle de bain",
+      type: "sensor",
+      status: "online",
+      dataBindings: [{ alias: "humidity", category: "humidity", value: 50 }] as Binding[],
       orderBindings: [],
     },
   };
@@ -543,10 +553,40 @@ describe("tank model", () => {
     expect(applyEnergy({ ...base(), storedWh: cap }, cap, 5000).storedWh).toBe(cap);
   });
 
-  it("anchors on the thermostat and retrains the full temperature", () => {
-    const m = anchorOnCutoff({ ...base(), storedWh: 1000 }, 280, 61.5);
-    expect(m.fullC).toBe(61.5);
+  it("anchors on the thermostat and adopts a hotter reading at once", () => {
+    const m = anchorOnCutoff({ ...base(), storedWh: 1000 }, 280, 64.2);
+    expect(m.fullC).toBe(64.2);
     expect(m.storedWh).toBe(tankCapacityWh(280, m)); // drift discarded
+  });
+
+  it("lets a cooler cut-off reading pull the full temperature down only slowly", () => {
+    // The setpoint is hardware; the probe's reading of it is not. This tank cut
+    // off at 64.2 °C one night and 61.8 °C three days later, and taking each at
+    // face value ratcheted `fullC` 64 -> 61.2 -> 57 — shrinking the modelled
+    // capacity every time, which makes an emptying tank look fuller.
+    const m = anchorOnCutoff({ ...base(), fullC: 64 }, 280, 58);
+    expect(m.fullC).toBe(63.5);
+  });
+
+  it("still converges when the setpoint really is turned down", () => {
+    let m = { ...base(), fullC: 64 };
+    for (let i = 0; i < 14; i++) m = anchorOnCutoff(m, 280, 57);
+    expect(m.fullC).toBe(57);
+  });
+
+  it("caps the model at what the probe can justify, and never lifts it", () => {
+    const m = { ...base(), coldC: 20, fullC: 60, anchored: true };
+    const cap = tankCapacityWh(280, m);
+    // Probe at 26 °C is 15 % of the span. A full model there is past anything
+    // stratification explains, so it comes down to 15 + 35.
+    const capped = capOnProbe({ ...m, storedWh: cap }, 280, 26);
+    expect(Math.round((capped.storedWh / cap) * 100)).toBe(50);
+    // Below the ceiling it is left alone — the guard rail only ever pulls down.
+    const low = capOnProbe({ ...m, storedWh: cap * 0.2 }, 280, 26);
+    expect(low.storedWh).toBe(cap * 0.2);
+    // And it says nothing before the first anchor, or with no reading.
+    expect(capOnProbe({ ...m, anchored: false, storedWh: cap }, 280, 26).storedWh).toBe(cap);
+    expect(capOnProbe({ ...m, storedWh: cap }, 280, null).storedWh).toBe(cap);
   });
 
   it("learns the cold inlet from the coldest reading ever seen", () => {
@@ -1217,9 +1257,11 @@ describe("createInstance", () => {
     await advance(6); // > 5 min cut-off delay
 
     expect(h.state.get("tankFull")).toBe(true);
-    // The anchor: drift discarded, and the probe retrains the full temperature.
+    // The anchor: drift discarded, and the probe retrains the full temperature
+    // — downwards one step at a time, so one stratified cut-off cannot rewrite
+    // the tank. The harness probe reads 45 °C; `fullC` starts at 60 and creeps.
     expect(h.state.get("tankCharge")).toBe(100);
-    expect(h.state.get("modelFullC")).toBe(45); // the harness probe reading
+    expect(h.state.get("modelFullC")).toBe(59.5);
     handle.stop();
   });
 
@@ -1348,8 +1390,11 @@ describe("createInstance", () => {
     handle.stop();
   });
 
-  it("puts the model and the probe side by side on the card", async () => {
-    // state.summary is the only place the observer shows without an API call.
+  it("says how full the tank is and what is missing, on the card", async () => {
+    // state.summary is the only place the observer shows without an API call,
+    // and the number every decision is taken on is the deficit — in showers,
+    // because that is the unit the household thinks in and `showerWh` is
+    // fitted from this tank's own history.
     at("2026-08-10T03:00:00");
     const h = buildHarness();
     const handle = createRecipe().createInstance(
@@ -1364,10 +1409,12 @@ describe("createInstance", () => {
     h.setBinding(HEATER, "power", 4);
     await advance(6); // thermostat cut-off → anchor
 
-    const summary = h.state.get("summary") as string;
-    expect(summary).toContain("Charge 100 %");
-    expect(summary).toContain("modèle 60 °C");
-    expect(summary).toContain("sonde 60 °C");
+    expect(h.state.get("summary")).toBe("Ballon chaud · charge 100 % · sonde 60 °C");
+
+    // A draw big enough to cost two showers, and the card says so.
+    h.setBinding(HEATER, "water_temperature", 34);
+    await advance(2);
+    expect(h.state.get("summary")).toMatch(/^Charge \d+ % · il manque \d+ douches · sonde 34 °C$/);
     handle.stop();
   });
 
@@ -1397,6 +1444,187 @@ describe("createInstance", () => {
     await advance(2);
     const afterDraw = h.state.get("modelStoredWh") as number;
     expect(afterCooling - afterDraw).toBeGreaterThan(1000);
+    handle.stop();
+  });
+
+  it("bills a draw that arrives in small steps, whatever the sensor's cadence", async () => {
+    // The failure the first threshold could not see. It compared the fall
+    // between two consecutive samples against 1 °C, which quietly made the
+    // detection a function of how chatty the sensor is: this probe reports
+    // every ~300 s while idle but every ~60 s as soon as it moves, so a real
+    // draw arrives as a long run of 0.4–0.6 °C steps, every one of them under
+    // the bar. On the evening of 2026-09-02 that classified 21 °C of collapse
+    // out of 36 as "cooling".
+    // Outside the off-peak window and with no surplus on offer, so nothing
+    // re-heats mid-draw and the only thing moving the balance is the probe.
+    at("2026-08-10T14:00:00");
+    const h = buildHarness({
+      initialState: {
+        powerProven: true,
+        modelAnchored: true,
+        modelColdC: 20,
+        modelFullC: 60,
+        modelStoredWh: 13026, // full
+        modelDrawWhPerC: 120,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70 },
+      h.ctx as never,
+    );
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(1);
+    const full = h.state.get("modelStoredWh") as number;
+
+    // 24 steps of 0.5 °C, one a minute: 12 °C of collapse, none of it a jump.
+    let t = 60;
+    for (let i = 0; i < 24; i++) {
+      t -= 0.5;
+      h.setBinding(HEATER, "water_temperature", t);
+      await advance(1);
+    }
+    expect(h.state.get("relayOn")).toBe(false);
+
+    // 12 °C at 120 Wh/°C is 1440 Wh, less whatever standing loss took.
+    const billed = full - (h.state.get("modelStoredWh") as number);
+    expect(billed).toBeGreaterThan(1400);
+    handle.stop();
+  });
+
+  it("latches the tank hot on an open thermostat, but anchors nothing on it", async () => {
+    // 2026-09-02, 11:24. A surplus cycle closed the relay on a tank the probe
+    // put at 57 °C. A thermostat has several degrees of differential, so it was
+    // still open from the night's cut-off and no current flowed — and the
+    // recipe read those zero watts as "the tank just filled": model back to
+    // 100 %, `fullC` dragged from 61.2 down to 57, the morning's deficit
+    // erased. Four draws later it still read 96 %, the evening shower ran cold,
+    // and nothing had asked for a single watt all day.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness({
+      drawWhenOn: 0, // thermostat already open: relay closes, nothing flows
+      initialState: {
+        powerProven: true, // proven on an earlier cycle, as it is in the field
+        modelAnchored: true,
+        modelColdC: 20,
+        modelFullC: 62,
+        modelStoredWh: 8000, // ~61 % of a 280 L tank: a real morning deficit
+        modelDrawWhPerC: 120,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    await advance(8); // past the grace period and the 5 min cut-off delay
+
+    // The latch still applies — the thermostat IS open, the tank IS hot, and
+    // heating it further would be pointless. That part was never wrong.
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.logLines.some((l) => l.startsWith("Thermostat déjà ouvert"))).toBe(true);
+
+    // But nothing was learned from it: the deficit stands, `fullC` is untouched,
+    // and no phantom kilowatt-hour was credited for a relay drawing nothing.
+    expect(h.state.get("modelFullC")).toBe(62);
+    expect(h.state.get("tankCharge")).toBeLessThan(65);
+    expect(h.state.get("modelStoredWh") as number).toBeLessThan(8000);
+    handle.stop();
+  });
+
+  it("bills a draw off the probe even when bathrooms are wired", async () => {
+    // The guard that caused the outage: with bathrooms configured the probe was
+    // muted entirely, on the reasoning that the showers ARE the draw signal. On
+    // 2026-09-02 four draws in a row produced no humidity rise at all, and the
+    // model billed exactly nothing for a tank that went from 61 °C to 26 °C.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70, bathroomSensors: [BATHROOM] },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(30);
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+    expect(h.state.get("tankCharge")).toBe(100);
+    const full = h.state.get("modelStoredWh") as number;
+
+    // A draw, and not a whisper from the bathroom.
+    h.setBinding(HEATER, "water_temperature", 45);
+    await advance(2);
+    expect(full - (h.state.get("modelStoredWh") as number)).toBeGreaterThan(1000);
+    handle.stop();
+  });
+
+  it("does not bill the same shower twice when the probe already saw it", async () => {
+    // The two detectors watch the same water through different instruments, and
+    // the humidity lags: the collapse of 2026-09-02 21:37 was over by 21:47 and
+    // the bathroom's rise did not close until 23:17. Charging both would bill
+    // that shower twice.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70, bathroomSensors: [BATHROOM] },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(30);
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+    const full = h.state.get("modelStoredWh") as number;
+
+    // The probe sees the shower first, and bills it.
+    h.setBinding(HEATER, "water_temperature", 48);
+    await advance(2);
+    const afterProbe = h.state.get("modelStoredWh") as number;
+    const probeBilled = full - afterProbe;
+    expect(probeBilled).toBeGreaterThan(1000);
+
+    // The bathroom catches up an hour later: rise, then the idle window closes.
+    h.setBinding(BATHROOM, "humidity", 58);
+    await advance(2);
+    h.setBinding(BATHROOM, "humidity", 58.5);
+    await advance(50); // > SHOWER_RISE_IDLE_MS, the rise is over
+    expect(h.logLines.some((l) => l.includes("douche détectée"))).toBe(true);
+    expect(h.logLines.some((l) => l.includes("déjà lu sur la sonde"))).toBe(true);
+
+    // Standing loss over the hour, and nothing else: the shower was already paid.
+    const afterShower = h.state.get("modelStoredWh") as number;
+    expect(afterProbe - afterShower).toBeLessThan(200);
+    handle.stop();
+  });
+
+  it("pulls a model that has drifted above the probe back down", async () => {
+    // The last line of defence. Whatever the balance believes, a probe sitting
+    // at the cold inlet cannot be hiding a nearly full tank: on the five
+    // cold-start nights measured, the gap between the probe's own fraction of
+    // the span and the charge the next cycle proved ran 10 to 26 points.
+    at("2026-08-10T14:00:00");
+    const h = buildHarness({
+      initialState: {
+        powerProven: true,
+        modelAnchored: true,
+        modelColdC: 20,
+        modelFullC: 60,
+        modelStoredWh: 13000, // the model says full…
+        modelDrawWhPerC: 120,
+        tankFull: false, // …and the latch has already expired
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70 },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 26); // …but the probe says empty
+    await advance(2);
+
+    expect(h.state.get("tankCharge") as number).toBeLessThanOrEqual(50);
+    expect(h.logLines.some((l) => l.startsWith("Modèle plafonné par la sonde"))).toBe(true);
     handle.stop();
   });
 

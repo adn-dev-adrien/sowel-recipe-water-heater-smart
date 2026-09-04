@@ -1392,9 +1392,10 @@ describe("createInstance", () => {
 
   it("says how full the tank is and what is missing, on the card", async () => {
     // state.summary is the only place the observer shows without an API call,
-    // and the number every decision is taken on is the deficit — in showers,
-    // because that is the unit the household thinks in and `showerWh` is
-    // fitted from this tank's own history.
+    // and the number every decision is taken on is the deficit. In kWh, not in
+    // showers: `showerWh` sat at 600 Wh on a tank whose showers cost about
+    // 1950, so a shower count was off by a factor of three on the one line the
+    // household actually reads.
     at("2026-08-10T03:00:00");
     const h = buildHarness();
     const handle = createRecipe().createInstance(
@@ -1411,10 +1412,10 @@ describe("createInstance", () => {
 
     expect(h.state.get("summary")).toBe("Ballon chaud · charge 100 % · sonde 60 °C");
 
-    // A draw big enough to cost two showers, and the card says so.
+    // A real draw, and the card says how much is missing.
     h.setBinding(HEATER, "water_temperature", 34);
     await advance(2);
-    expect(h.state.get("summary")).toMatch(/^Charge \d+ % · il manque \d+ douches · sonde 34 °C$/);
+    expect(h.state.get("summary")).toMatch(/^Charge \d+ % · il manque \d+\.\d kWh · sonde 34 °C$/);
     handle.stop();
   });
 
@@ -1444,6 +1445,103 @@ describe("createInstance", () => {
     await advance(2);
     const afterDraw = h.state.get("modelStoredWh") as number;
     expect(afterCooling - afterDraw).toBeGreaterThan(1000);
+    handle.stop();
+  });
+
+  /**
+   * The rescue, judged on the two evenings that defined it.
+   *
+   * Both are replayed the same way: an anchored model on the tank's measured
+   * capacity (6469 Wh), wound to the charge reconstructed from what the
+   * following off-peak cycle had to put back, outside the off-peak window and
+   * with no surplus on offer so nothing else can touch the relay.
+   */
+  async function tankAt(chargeFraction: number) {
+    const capacity = Math.round(135 * 1.163 * (61 - 20)); // 6437 Wh
+    const h = buildHarness({
+      initialState: {
+        powerProven: true,
+        modelAnchored: true,
+        modelColdC: 20,
+        modelFullC: 61,
+        modelStoredWh: Math.round(capacity * chargeFraction),
+        modelDrawWhPerC: 112,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      {
+        ...BASE_PARAMS,
+        tankVolume: 135,
+        standbyPower: 70,
+        minTemp: 30,
+        rescueTemp: 45,
+        rescueCharge: 50,
+        rescueChargeUpTo: 75,
+      },
+      h.ctx as never,
+    );
+    // A settled probe well above the temperature floor, so only the charge
+    // threshold can be the thing deciding.
+    h.setBinding(HEATER, "water_temperature", 45);
+    await advance(2);
+    return { h, handle };
+  }
+
+  it("stays out of the way after one shower on a tank that is still two thirds full", async () => {
+    // 2026-09-03, 20:41. The water was hot and stayed hot. The probe had dived
+    // to 33.4 °C — a transient it recovered from by 12 °C with the heater off —
+    // and a floor set on that reading fired three minutes into the shower,
+    // burning 0.89 kWh at peak tariff. The charge tells the truth: 66 %.
+    at("2026-09-03T20:45:00");
+    const { h, handle } = await tankAt(0.66);
+    expect(h.state.get("relayOn")).toBe(false);
+    expect(h.logLines.some((l) => l.startsWith("Chauffe démarrée"))).toBe(false);
+    handle.stop();
+  });
+
+  it("fires before the tank runs cold, at any hour and whatever the tariff", async () => {
+    // 2026-09-02, 20:00. Same evening slot, no off-peak, no sun — and an hour
+    // later a shower ran cold. 49 % charge, so the rescue heats now.
+    at("2026-09-02T20:00:00");
+    const { h, handle } = await tankAt(0.49);
+    expect(h.state.get("relayOn")).toBe(true);
+    expect(h.state.get("reason")).toBe("floor");
+    expect(h.logLines.some((l) => l.includes("Chauffe démarrée (plancher)"))).toBe(true);
+    handle.stop();
+  });
+
+  it("keeps the rescue running past its own trigger, up to the target", async () => {
+    at("2026-09-02T20:00:00");
+    const { h, handle } = await tankAt(0.49);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    // Above the 50 % trigger but below the 75 % target: still heating, or the
+    // rescue would chatter on and off around its own threshold.
+    await advance(20);
+    expect(h.state.get("tankCharge") as number).toBeGreaterThan(50);
+    expect(h.state.get("relayOn")).toBe(true);
+    handle.stop();
+  });
+
+  it("leaves the rescue disabled when the charge threshold is zero", async () => {
+    at("2026-09-02T20:00:00");
+    const h = buildHarness({
+      initialState: {
+        powerProven: true,
+        modelAnchored: true,
+        modelColdC: 20,
+        modelFullC: 61,
+        modelStoredWh: 500, // all but empty
+        modelDrawWhPerC: 112,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 135, standbyPower: 70, minTemp: 30, rescueCharge: 0 },
+      h.ctx as never,
+    );
+    h.setBinding(HEATER, "water_temperature", 45); // above the probe floor
+    await advance(2);
+    expect(h.state.get("relayOn")).toBe(false);
     handle.stop();
   });
 
@@ -1595,6 +1693,39 @@ describe("createInstance", () => {
     // Standing loss over the hour, and nothing else: the shower was already paid.
     const afterShower = h.state.get("modelStoredWh") as number;
     expect(afterProbe - afterShower).toBeLessThan(200);
+    handle.stop();
+  });
+
+  it("measures what a shower costs, from the probe that weighed it", async () => {
+    // `showerWh` used to be fitted from a ratio, and the ratio was fed by
+    // nights whose deficit came from draws nothing was billing: it sat at
+    // 600 Wh on a tank whose showers cost about 1950, which put "il manque
+    // 1 douche" three times off on the card and skewed the surplus threshold.
+    // Two instruments on one event settle it — humidity counts, probe weighs.
+    at("2026-08-10T03:00:00");
+    const h = buildHarness();
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70, bathroomSensors: [BATHROOM] },
+      h.ctx as never,
+    );
+    await advance(1);
+    h.setBinding(HEATER, "water_temperature", 60);
+    await advance(30);
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+    expect(h.state.get("modelShowerWh")).toBe(1500); // the starting guess
+
+    // 20 °C off the probe at 120 Wh/°C: a 2400 Wh shower.
+    h.setBinding(HEATER, "water_temperature", 40);
+    await advance(2);
+    h.setBinding(BATHROOM, "humidity", 58);
+    await advance(2);
+    h.setBinding(BATHROOM, "humidity", 58.5);
+    await advance(50); // the rise closes
+
+    // Smoothed a third of the way from 1500 towards what the probe weighed.
+    expect(h.state.get("modelShowerWh") as number).toBeGreaterThan(1600);
+    expect(h.logLines.some((l) => l.includes("coût d'une douche mesuré à"))).toBe(true);
     handle.stop();
   });
 

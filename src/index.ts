@@ -627,8 +627,13 @@ const SHOWER_RISE_PTS = 4;
 const SHOWER_STEP_PTS = 2;
 /** A rise that stops climbing this long is over. */
 const SHOWER_RISE_IDLE_MS = 45 * 60 * 1000;
-/** Starting cost of one shower, Wh. Fitted nightly like `drawWhPerC`. */
+/** Starting cost of one shower, Wh. Measured against the probe whenever the two
+ *  detectors see the same water — see `detectShowers`. */
 export const DEFAULT_SHOWER_WH = 1500;
+/** Bounds on the measured shower cost. A rise mis-counted as one shower when it
+ *  was six would otherwise teach a figure six times too big. */
+const SHOWER_WH_MIN = 200;
+const SHOWER_WH_MAX = 4000;
 
 /** How many showers a humidity rise of this length stands for. */
 export function showersFromRise(durationMin: number): number {
@@ -953,12 +958,23 @@ function buildSlots(): RecipeSlotDef[] {
       group: "floor",
     },
     {
-      id: "tankFullMemory",
-      name: "Stays hot for",
-      description: "Then heats again",
-      type: "duration",
+      id: "rescueCharge",
+      name: "Charge floor",
+      description: "Heats now (%)",
+      type: "number",
       required: false,
-      defaultValue: "12h",
+      defaultValue: 35,
+      constraints: { min: 0, max: 90 },
+      group: "floor",
+    },
+    {
+      id: "rescueChargeUpTo",
+      name: "Charge target",
+      description: "Ends there (%)",
+      type: "number",
+      required: false,
+      defaultValue: 65,
+      constraints: { min: 5, max: 100 },
       group: "floor",
     },
 
@@ -1083,6 +1099,15 @@ function buildSlots(): RecipeSlotDef[] {
       group: "cutoff",
     },
     {
+      id: "tankFullMemory",
+      name: "Stays hot for",
+      description: "Then heats again",
+      type: "duration",
+      required: false,
+      defaultValue: "12h",
+      group: "cutoff",
+    },
+    {
       id: "bathroomSensors",
       name: "Bathroom sensors",
       description: "Humidity — counts showers",
@@ -1160,6 +1185,14 @@ const FR: RecipeLangPack = {
     rescueTemp: {
       name: "Secours \u00e0",
       description: "Fin du secours (\u00b0C)",
+    },
+    rescueCharge: {
+      name: "Charge mini",
+      description: "Chauffe aussit\u00f4t (%)",
+    },
+    rescueChargeUpTo: {
+      name: "Charge vis\u00e9e",
+      description: "Fin du secours (%)",
     },
     tankFullMemory: {
       name: "Reste chaud",
@@ -1253,7 +1286,7 @@ const FR: RecipeLangPack = {
     hc: "Heures creuses",
     tank: "Mod\u00e8le de charge du ballon",
     solar: "Surplus solaire",
-    cutoff: "D\u00e9tection de coupure sans mesure d\u00e9di\u00e9e",
+    cutoff: "Ballon plein : d\u00e9tection et m\u00e9moire",
     advanced: "R\u00e9glages avanc\u00e9s",
   },
 };
@@ -1323,6 +1356,12 @@ export function createRecipe(): RecipeDefinition {
       const rescueTemp = toNumber(params.rescueTemp) ?? 25;
       if (rescueTemp <= minTemp) {
         throw new Error("Recovery temperature must be above the minimum temperature");
+      }
+
+      const rescueCharge = toNumber(params.rescueCharge) ?? 35;
+      const rescueChargeUpTo = toNumber(params.rescueChargeUpTo) ?? 65;
+      if (rescueCharge > 0 && rescueChargeUpTo <= rescueCharge) {
+        throw new Error("Recovery charge must be above the rescue charge threshold");
       }
 
       // Only an alias the user typed can be wrong. Left empty, the binding is
@@ -1458,6 +1497,13 @@ export function createRecipe(): RecipeDefinition {
 
       const minTemp = toNumber(params.minTemp) ?? 20;
       const rescueTemp = toNumber(params.rescueTemp) ?? 25;
+      /** Rescue on the modelled charge. 0 disables it, leaving the probe floor
+       *  as the only safety — which is all an install without a model has. */
+      const rescueChargeFraction = Math.max(0, (toNumber(params.rescueCharge) ?? 35) / 100);
+      const rescueChargeUpToFraction = Math.max(
+        rescueChargeFraction,
+        (toNumber(params.rescueChargeUpTo) ?? 65) / 100,
+      );
       const tempMaxAgeMs = ctx.helpers.parseDuration(params.tempMaxAge ?? "2h") || 2 * 3600_000;
       // How long a probe-corroborated "tank is full" is trusted. Clamped to at
       // least the blind TTL: a shorter value would make the probe a liability.
@@ -2383,9 +2429,39 @@ export function createRecipe(): RecipeDefinition {
         // 1. Hot-water floor — the only reason that ignores the tank-full latch
         //    being *absent*; it still yields to it, because a stratified tank
         //    reads cold at the bottom while the thermostat is already open.
+        //
+        //    Two thresholds, and the *charge* one is the real safety.
+        //
+        //    A threshold on the raw probe cannot express "the tank is nearly
+        //    empty", because during a draw the probe undershoots the settled
+        //    reading by around 12 °C and takes half an hour to come back: on
+        //    2026-09-03 one shower drove it from 49.8 to 33.4 °C and it climbed
+        //    back to 45.2 with the heater off. A floor at 38 °C fired three
+        //    minutes into that shower, on a tank still 66 % charged with two
+        //    showers in it, and burnt 0.89 kWh at peak tariff for nothing.
+        //
+        //    The modelled charge has no such transient — it is billed as the
+        //    water leaves and it does not recover — and the three measured
+        //    moments separate cleanly on it: 66 % after that shower (hot water,
+        //    must not fire), 49 % an hour before the cold shower of 2026-09-02
+        //    (must fire), 44 % when that shower actually ran cold. Note how
+        //    high the cold-water line sits: below roughly half, what is left is
+        //    lukewarm rather than a hot layer, so the setting belongs near 50
+        //    on this tank and nowhere near zero.
+        //
+        //    The probe floor stays underneath as the last resort — it is all an
+        //    install has before the model has ever anchored.
         if (s.temp !== null && !isTankFull(s.temp, s.now)) {
           if (s.temp < minTemp) return "floor";
           if (reason === "floor" && relayOn && s.temp < rescueTemp) return "floor";
+        }
+        if (rescueChargeFraction > 0 && tank.anchored && !isTankFull(s.temp, s.now)) {
+          const capacityWh = tankCapacityWh(tankVolumeL, tank);
+          if (capacityWh > 0) {
+            const charge = tank.storedWh / capacityWh;
+            const target = reason === "floor" && relayOn ? rescueChargeUpToFraction : rescueChargeFraction;
+            if (charge < target) return "floor";
+          }
         }
 
         if (mode === "boost") {
@@ -2754,6 +2830,12 @@ export function createRecipe(): RecipeDefinition {
           // for what the probe missed over the same stretch of evening —
           // usually everything, once the probe has saturated at the inlet, and
           // usually nothing when it was still free to fall.
+          // Two instruments on one event give the cost of a shower directly:
+          // the humidity counts them, the probe weighs them. That is a
+          // measurement, and it replaces a ratio fit that had no way of being
+          // right — `showerWh` had been dragged to 600 Wh by nights whose
+          // deficit came from draws nothing was billing, while the probe puts a
+          // real shower on this tank at about 1950 Wh.
           const claimedWh = showers * tank.showerWh;
           const seenByProbeWh = probeDebits
             .filter((d) => d.at >= open.startedAt - PROBE_DEBIT_MATCH_MS && d.at <= s.now)
@@ -2763,12 +2845,29 @@ export function createRecipe(): RecipeDefinition {
             tank = applyEnergy(tank, capacity, -billedWh);
             billedByShowersWh += billedWh;
           }
+          // Weighed by the probe over the same water: learn what a shower costs
+          // here. Smoothed like every other coefficient — one evening is
+          // evidence, not proof — and only when the probe actually saw it.
+          let learned: number | null = null;
+          if (seenByProbeWh > 0) {
+            const measured = seenByProbeWh / showers;
+            learned = Math.round(
+              Math.max(
+                SHOWER_WH_MIN,
+                Math.min(
+                  SHOWER_WH_MAX,
+                  tank.showerWh * (1 - DRAW_COEFF_ALPHA) + measured * DRAW_COEFF_ALPHA,
+                ),
+              ),
+            );
+            if (learned !== tank.showerWh) tank = { ...tank, showerWh: learned };
+          }
           ctx.log(
             `${showers} douche${showers > 1 ? "s" : ""} détectée${showers > 1 ? "s" : ""} — ${nameOf(id)}, humidité +${Math.round(open.peak - open.from)} pts sur ${Math.round(minutes)} min${
               billedWh < claimedWh
                 ? ` ; ${Math.round(billedWh)} Wh facturés, le reste déjà lu sur la sonde`
                 : ` ; ${Math.round(billedWh)} Wh facturés`
-            }`,
+            }${learned !== null ? `, coût d'une douche mesuré à ${Math.round(seenByProbeWh / showers)} Wh → ${learned} Wh` : ""}`,
           );
         }
       }
@@ -2923,23 +3022,22 @@ export function createRecipe(): RecipeDefinition {
         //
         // No equivalent-litres figure. It reads as "four showers left" because
         // it assumes perfect stratification; the tank is mixed enough that a
-        // 47 °C mean gave a cold shower while that number said 191 L. Showers
-        // are honest about their own precision: `showerWh` is fitted from this
-        // tank's history, and the unit is what the household thinks in.
+        // 47 °C mean gave a cold shower while that number said 191 L.
+        //
+        // And no shower count either, until `showerWh` has been measured
+        // against the probe rather than fitted: it sat at 600 Wh on a tank
+        // whose showers cost about 1950, so "il manque 1 douche" was off by a
+        // factor of three on the one line the household actually reads. The
+        // deficit in kWh depends on nothing but the balance itself.
         const missingWh = deficitWh();
-        const missingShowers = tank.showerWh > 0 ? missingWh / tank.showerWh : 0;
         const probePart = s.temp !== null ? ` · sonde ${s.temp.toFixed(0)} °C` : "";
         ctx.state.set(
           "summary",
           charge === null
             ? "Modèle de charge : en attente du premier ancrage"
-            : missingShowers < 0.5
+            : missingWh < 250
               ? `Ballon chaud · charge ${charge} %${probePart}`
-              : `Charge ${charge} % · il manque ${
-                  missingShowers < 1.5
-                    ? "1 douche"
-                    : `${Math.round(missingShowers)} douches`
-                }${probePart}`,
+              : `Charge ${charge} % · il manque ${(missingWh / 1000).toFixed(1)} kWh${probePart}`,
         );
         ctx.state.set("status", relayOn ? "heating" : manualOn ? "manual" : "off");
         ctx.state.set("reason", reason);
@@ -3083,7 +3181,11 @@ export function createRecipe(): RecipeDefinition {
           startupWindow
             ? `${minutesToHm(startupWindow.startMin)}→${minutesToHm(startupWindow.endMin)} (${hcMode})`
             : "indisponible"
-        }, plancher ${minTemp}→${rescueTemp} °C, ${capabilities}`,
+        }, plancher ${minTemp}→${rescueTemp} °C${
+          rescueChargeFraction > 0
+            ? ` et secours sous ${Math.round(rescueChargeFraction * 100)} % de charge (jusqu'à ${Math.round(rescueChargeUpToFraction * 100)} %)`
+            : ""
+        }, ${capabilities}`,
       );
       if (!tempAlias()) {
         warnOnce(

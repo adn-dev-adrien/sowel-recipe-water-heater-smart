@@ -6,6 +6,8 @@ import {
   applyEnergy,
   anchorOnCutoff,
   capOnProbe,
+  estimateHeatMinutes,
+  learnMinPerDegC,
   learnColdInlet,
   calibrateDrawCoefficient,
   showersFromRise,
@@ -533,7 +535,7 @@ describe("findOnOffOrderAlias", () => {
 // ============================================================
 
 describe("tank model", () => {
-  const base = () => ({ storedWh: 0, coldC: 23, fullC: 63, drawWhPerC: 120, showerWh: 1500, anchored: false });
+  const base = () => ({ storedWh: 0, coldC: 23, fullC: 63, drawWhPerC: 120, showerWh: 1500, minPerDegC: 2.6, anchored: false });
 
   it("prices the tank from its volume and learned span", () => {
     // 280 L raised 40 K = 280 * 1.163 * 40 = 13 026 Wh, the figure the night
@@ -587,6 +589,45 @@ describe("tank model", () => {
     // And it says nothing before the first anchor, or with no reading.
     expect(capOnProbe({ ...m, anchored: false, storedWh: cap }, 280, 26).storedWh).toBe(cap);
     expect(capOnProbe({ ...m, storedWh: cap }, 280, null).storedWh).toBe(cap);
+  });
+
+  it("estimates the heat from the distance the probe has left to climb", () => {
+    const m = { ...base(), fullC: 61, minPerDegC: 2.62, anchored: true };
+    // 2026-09-04: probe at 46.4 °C, and the cycle took 42 min.
+    expect(estimateHeatMinutes(m, 46.4)).toBe(Math.round(14.6 * 2.62) + 20);
+    // A hotter tank needs less, and that is the whole point of the placement.
+    expect(estimateHeatMinutes(m, 55.2)!).toBeLessThan(estimateHeatMinutes(m, 46.4)!);
+    // Nothing to say without a reading, or before the first anchor.
+    expect(estimateHeatMinutes(m, null)).toBeNull();
+    expect(estimateHeatMinutes({ ...m, anchored: false }, 46.4)).toBeNull();
+  });
+
+  it("learns the slope from a cycle with real ground to cover", () => {
+    const m = { ...base(), fullC: 61, minPerDegC: 2.6, anchored: true };
+    // 2026-09-03: 98 min from 26 °C — 35 °C of span, so 2.80 min/°C observed.
+    const next = learnMinPerDegC(m, 26, 98);
+    expect(next.minPerDegC).toBeGreaterThan(2.6);
+    expect(next.minPerDegC).toBeLessThan(2.8); // smoothed, not adopted whole
+  });
+
+  it("refuses a cycle too short to say anything about the slope", () => {
+    const m = { ...base(), fullC: 61, minPerDegC: 2.6, anchored: true };
+    // The three cycles under 8 °C that week reported 10.0, 4.2 and 1.4 min/°C
+    // against 1.9-3.0 for the ones that qualified. Ratios of small numbers.
+    expect(learnMinPerDegC(m, 60.2, 8).minPerDegC).toBe(2.6);
+    expect(learnMinPerDegC(m, 55.2, 8).minPerDegC).toBe(2.6);
+    expect(learnMinPerDegC(m, null, 40).minPerDegC).toBe(2.6);
+  });
+
+  it("converges on the slope the week actually measured", () => {
+    // The five qualifying cycles of 2026-09-03..09, fed in order. A least
+    // squares fit over the same five gives 2.62 min/°C.
+    let m = { ...base(), fullC: 61, minPerDegC: 2.6, anchored: true };
+    for (const [probe, mins] of [[26, 98], [46.4, 42], [48, 33], [40.2, 40], [49.8, 33]] as const) {
+      m = learnMinPerDegC(m, probe, mins);
+    }
+    expect(m.minPerDegC).toBeGreaterThan(2.3);
+    expect(m.minPerDegC).toBeLessThan(2.9);
   });
 
   it("learns the cold inlet from the coldest reading ever seen", () => {
@@ -1360,7 +1401,10 @@ describe("createInstance", () => {
     at("2026-08-10T03:00:00");
     const h = buildHarness();
     const handle = createRecipe().createInstance(
-      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70, hcEstimate: "3h" },
+      // `full` placement: this test is about what a cycle teaches, not about
+      // where the cycle is placed — and once the probe drives the placement, a
+      // nearly full tank is scheduled against the end of the window.
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70, hcEstimate: "3h", hcMode: "full" },
       h.ctx as never,
     );
     // First cycle anchors the observer on a full tank. It still teaches: with
@@ -1545,6 +1589,83 @@ describe("createInstance", () => {
     handle.stop();
   });
 
+  it("places the off-peak cycle against the end of its window, from the probe", async () => {
+    // What this replaces: a single learned duration, 244 min, applied to every
+    // night whatever the tank held. Five nights running it started at 01:56 and
+    // the thermostat cut between 02:04 and 02:38 — three and a half hours of
+    // standing loss before anyone got up.
+    at("2026-09-08T23:30:00");
+    const h = buildHarness({
+      initialState: {
+        powerProven: true,
+        modelAnchored: true,
+        modelColdC: 20,
+        modelFullC: 61,
+        modelStoredWh: 4300,
+        modelDrawWhPerC: 112,
+        modelMinPerDegC: 2.6,
+        hcEstimateMin: 244,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 135, standbyPower: 70, hcEstimate: "4h" },
+      h.ctx as never,
+    );
+    // 2026-09-09: the probe sat at 55.2 °C and the cycle needed 8 minutes.
+    h.setBinding(HEATER, "water_temperature", 55.2);
+    await advance(2);
+
+    // (61 - 55.2) * 2.6 + 20 = 35 min, so the cycle is placed at 05:25, not
+    // 01:56. The relay stays open at 23:30 — nothing to do yet.
+    expect(h.state.get("hcRequiredMin")).toBe(35);
+    expect(h.state.get("hcHeatFrom")).toBe("05:25");
+    expect(h.state.get("hcHeatTo")).toBe("06:00");
+    expect(h.state.get("relayOn")).toBe(false);
+
+    // A colder tank is a longer cycle, so it starts earlier — the placement
+    // follows the tank instead of the calendar.
+    h.setBinding(HEATER, "water_temperature", 46.4);
+    await advance(2);
+    expect(h.state.get("hcHeatFrom")).toBe("05:02");
+    handle.stop();
+  });
+
+  it("learns the placement from a cycle the old gate would have thrown away", async () => {
+    // The deadlock the charge rescue created: `hcEstimateMin` only learned from
+    // a cycle that started under half full, and the rescue exists precisely to
+    // keep the tank above that. Five nights, five times "estimation inchangée
+    // (244 min)", every one of them reading "Ballon déjà chargé à 64-81 %".
+    // The slope is fitted on the temperature span instead, which a two-thirds
+    // full tank still has plenty of.
+    at("2026-09-09T01:00:00");
+    const h = buildHarness({
+      initialState: {
+        powerProven: true,
+        modelAnchored: true,
+        modelColdC: 20,
+        modelFullC: 61,
+        modelStoredWh: 4300, // 67 % — the old gate refused anything above 50
+        modelDrawWhPerC: 112,
+        modelMinPerDegC: 2.6,
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, tankVolume: 135, standbyPower: 70, hcMode: "full" },
+      h.ctx as never,
+    );
+    h.setBinding(HEATER, "water_temperature", 46.4); // 14.6 °C to close
+    await advance(2);
+    expect(h.state.get("relayOn")).toBe(true);
+
+    await advance(60); // a full hour of heating: 60 / 14.6 = 4.1 min/°C
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+
+    expect(h.logLines.some((l) => l.startsWith("Vitesse de chauffe recalée"))).toBe(true);
+    expect(h.state.get("modelMinPerDegC") as number).toBeGreaterThan(2.6);
+    handle.stop();
+  });
+
   it("bills a draw that arrives in small steps, whatever the sensor's cadence", async () => {
     // The failure the first threshold could not see. It compared the fall
     // between two consecutive samples against 1 °C, which quietly made the
@@ -1610,7 +1731,9 @@ describe("createInstance", () => {
       },
     });
     const handle = createRecipe().createInstance(
-      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70 },
+      // `full` placement: the restored model is anchored from the first tick,
+      // so the probe would otherwise push this cycle to the end of the window.
+      { ...BASE_PARAMS, tankVolume: 280, standbyPower: 70, hcMode: "full" },
       h.ctx as never,
     );
     await advance(1);

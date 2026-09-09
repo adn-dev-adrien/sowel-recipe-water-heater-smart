@@ -546,6 +546,21 @@ export interface TankModel {
    *  bathroom humidity is available — the probe cannot count showers. */
   showerWh: number;
   /**
+   * Minutes of heating per °C the probe still has to climb — what places the
+   * off-peak cycle against the end of its window.
+   *
+   * Deliberately *not* derived from the energy balance. The stored-energy
+   * deficit is the right quantity for deciding whether to heat, and the wrong
+   * one for deciding how long: measured over five nights it predicted the
+   * energy actually delivered with ratios from 0.19 to 1.10, because the
+   * thermostat opens on its own sensing point rather than on the tank's mean.
+   * The probe and the thermostat are two sensors on the same tank, so the
+   * distance between them is what the cycle has to close, and it closes at a
+   * near-constant rate under a fixed resistor — 0.38 °C/min here, holding from
+   * an 8 min top-up to a 98 min heat from cold.
+   */
+  minPerDegC: number;
+  /**
    * False until the first thermostat cut-off. Before that the balance has no
    * origin, so every figure derived from it is meaningless — and "0 %" on a
    * hot tank is worse than no number at all. The UI says so instead.
@@ -684,6 +699,35 @@ const PROBE_CAP_MARGIN = 0.35;
  */
 const FULL_C_DECAY_C = 0.5;
 
+/**
+ * Starting guess for `minPerDegC`, replaced by the first cycle that qualifies.
+ * 2.6 min/°C is 0.38 °C/min, which is what a ~2.4 kW resistor does to the
+ * bottom of a domestic tank.
+ */
+export const DEFAULT_MIN_PER_DEG_C = 2.6;
+/**
+ * A cycle only teaches the slope if it had a real distance to close.
+ *
+ * Below that the measurement is a ratio of two small numbers and it is noise:
+ * the three cycles under 8 °C in the week of 2026-09-03 reported 10.0, 4.2 and
+ * 1.4 min/°C, against 1.9–3.0 for the five that qualified. Letting them in
+ * would have swung the placement by hours.
+ */
+const LEARN_MIN_SPAN_C = 8;
+/** Bounds on the slope: a cycle interrupted by something else must not teach a
+ *  placement that no longer fits in any window. */
+const MIN_PER_DEG_C_MIN = 0.5;
+const MIN_PER_DEG_C_MAX = 15;
+/**
+ * Safety margin on the placement, minutes.
+ *
+ * The asymmetry is the whole point. Finishing early costs standing loss for the
+ * rest of the window; finishing late means the window closes on a tank that is
+ * not full, and the next hot water is bought at peak tariff. Sized on the worst
+ * under-estimate observed over eight cycles (9.8 min) with room to spare.
+ */
+const HC_PLACEMENT_MARGIN_MIN = 20;
+
 /** Bounds on the fitted coefficient — a bad night must not wreck the model. */
 const DRAW_COEFF_MIN = 20;
 const DRAW_COEFF_MAX = 600;
@@ -765,6 +809,45 @@ export function capOnProbe(
   const ceiling = capacityWh * Math.min(1, Math.max(0, probeFraction) + PROBE_CAP_MARGIN);
   if (model.storedWh <= ceiling) return model;
   return { ...model, storedWh: ceiling };
+}
+
+/**
+ * How long the off-peak cycle needs, from where the probe sits right now.
+ *
+ * `null` when there is nothing to go on — no reading, or no anchor yet, so no
+ * idea what "full" reads as. The caller falls back to the learned scalar, which
+ * is all an install without a probe ever had.
+ */
+export function estimateHeatMinutes(model: TankModel, probeC: number | null): number | null {
+  if (!model.anchored || probeC === null) return null;
+  const span = model.fullC - probeC;
+  if (span <= 0) return 0;
+  return Math.round(span * model.minPerDegC) + HC_PLACEMENT_MARGIN_MIN;
+}
+
+/**
+ * Refine the slope from a cycle that ran to the thermostat.
+ *
+ * Returns the model unchanged when the cycle had too little ground to cover to
+ * mean anything — see `LEARN_MIN_SPAN_C`. Smoothed like every other
+ * coefficient: one night is evidence, not proof.
+ */
+export function learnMinPerDegC(
+  model: TankModel,
+  probeAtStartC: number | null,
+  measuredMin: number,
+): TankModel {
+  if (probeAtStartC === null || measuredMin <= 0) return model;
+  const span = model.fullC - probeAtStartC;
+  if (span < LEARN_MIN_SPAN_C) return model;
+  const observed = measuredMin / span;
+  const next =
+    model.minPerDegC * (1 - DRAW_COEFF_ALPHA) + observed * DRAW_COEFF_ALPHA;
+  return {
+    ...model,
+    minPerDegC:
+      Math.round(Math.max(MIN_PER_DEG_C_MIN, Math.min(MIN_PER_DEG_C_MAX, next)) * 100) / 100,
+  };
 }
 
 /** The coldest reading ever seen is the inlet temperature, learned for free. */
@@ -1580,6 +1663,7 @@ export function createRecipe(): RecipeDefinition {
         fullC: 60,
         drawWhPerC: DEFAULT_DRAW_WH_PER_C,
         showerWh: DEFAULT_SHOWER_WH,
+        minPerDegC: DEFAULT_MIN_PER_DEG_C,
         anchored: false,
       };
       /** Last probe reading that actually differed, and when it arrived. Draws
@@ -1590,6 +1674,9 @@ export function createRecipe(): RecipeDefinition {
       let lastModelAt: number | null = null;
       /** Stored energy when the running cycle began — the calibration target. */
       let storedAtCycleStart: number | null = null;
+      /** Probe reading when the running cycle began — what the slope is fitted
+       *  against, and the one number the placement will need next time. */
+      let probeAtCycleStart: number | null = null;
       /** Per bathroom: the humidity rise currently under way, if any. */
       const rises = new Map<
         string,
@@ -1873,8 +1960,28 @@ export function createRecipe(): RecipeDefinition {
         billedByProbeWh = 0;
         billedByShowersWh = 0;
         probeDebits.length = 0;
+
+        // The placement coefficient, fitted before the anchor moves `fullC`.
+        // Every cycle that reached the thermostat teaches it, whatever charge
+        // it started from — which is the point. The scalar it replaces could
+        // only learn from a cycle starting under half full, and once the charge
+        // rescue was keeping the tank above that line no off-peak cycle ever
+        // qualified again: five nights running, "estimation inchangée (244
+        // min)", every one of them finishing more than three hours early.
+        if (cycleStartedAt !== null && probeAtCycleStart !== null) {
+          const measured = Math.max(0, Math.round((endedAt - cycleStartedAt) / 60000));
+          const before = tank.minPerDegC;
+          tank = learnMinPerDegC(tank, probeAtCycleStart, measured);
+          if (tank.minPerDegC !== before) {
+            ctx.log(
+              `Vitesse de chauffe recalée : ${measured} min pour ${(tank.fullC - probeAtCycleStart).toFixed(1)} °C — ${before} → ${tank.minPerDegC} min/°C`,
+            );
+          }
+        }
+
         tank = anchorOnCutoff(tank, tankVolumeL, temp);
         storedAtCycleStart = null;
+        probeAtCycleStart = null;
 
         if (cycleStartedAt !== null) {
           const measured = Math.max(0, Math.round((endedAt - cycleStartedAt) / 60000));
@@ -2055,13 +2162,27 @@ export function createRecipe(): RecipeDefinition {
         return now - lastFullCycleAt > fullCycleEveryDays * 24 * 60 * 60 * 1000;
       }
 
-      function hcHeatWindow(now: number): { startMin: number; endMin: number } | null {
+      /**
+       * How long to reserve inside the off-peak window.
+       *
+       * The probe wins wherever it can answer, because the question is "how far
+       * is this tank from its thermostat", and that is exactly the distance the
+       * probe measures. `hcEstimateMin` stays underneath for installs with no
+       * probe or no anchor yet — it is a single duration for every state of the
+       * tank, which is why it placed a 8 min top-up and a 98 min heat from cold
+       * at the same hour of the night.
+       */
+      function requiredHeatMin(temp: number | null): number {
+        return estimateHeatMinutes(tank, temp) ?? hcEstimateMin;
+      }
+
+      function hcHeatWindow(now: number, temp: number | null): { startMin: number; endMin: number } | null {
         const w = resolveHcWindow();
         announceWindow(w);
         if (!w) return null;
         const full = needsFullCycle(now) || forecastWantsFullNight();
         const effective = full ? "full" : hcMode;
-        return computeHcHeatWindow(w.startMin, w.endMin, effective, hcEstimateMin);
+        return computeHcHeatWindow(w.startMin, w.endMin, effective, requiredHeatMin(temp));
       }
 
       // ── Decision ──────────────────────────────────────────
@@ -2156,7 +2277,7 @@ export function createRecipe(): RecipeDefinition {
 
         const nMin = nowMinutes(date);
         const hcWindow = resolveHcWindow();
-        const heat = hcHeatWindow(now);
+        const heat = hcHeatWindow(now, temp);
         return {
           now,
           nowMin: nMin,
@@ -2504,6 +2625,7 @@ export function createRecipe(): RecipeDefinition {
           onSince = s.now;
           cycleStartedAt = s.now;
           storedAtCycleStart = tank.storedWh;
+          probeAtCycleStart = s.temp;
           lowPowerSince = null;
           householdLowSince = null;
           cyclePeakPower = 0;
@@ -2976,10 +3098,11 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("modelColdC", Math.round(tank.coldC * 10) / 10);
         ctx.state.set("modelFullC", Math.round(tank.fullC * 10) / 10);
         ctx.state.set("modelDrawWhPerC", tank.drawWhPerC);
+        ctx.state.set("modelMinPerDegC", tank.minPerDegC);
       }
 
       function publish(s: Snapshot): void {
-        const heat = hcHeatWindow(s.now);
+        const heat = hcHeatWindow(s.now, s.temp);
         // Instrumentation: five nights have started exactly 120 min before the
         // computed placement, and nothing in the code explains it. Publish the
         // resolved slot and the placement every tick — the published label was
@@ -2999,6 +3122,8 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("modelColdC", round1(tank.coldC));
         ctx.state.set("modelFullC", round1(tank.fullC));
         ctx.state.set("modelDrawWhPerC", tank.drawWhPerC);
+        ctx.state.set("modelMinPerDegC", tank.minPerDegC);
+        ctx.state.set("hcRequiredMin", requiredHeatMin(s.temp));
         ctx.state.set("modelAnchored", tank.anchored);
         ctx.state.set("modelShowerWh", tank.showerWh);
         ctx.state.set("showersSinceAnchor", showersSinceAnchor);
@@ -3123,6 +3248,7 @@ export function createRecipe(): RecipeDefinition {
           fullC: num("modelFullC") ?? 60,
           drawWhPerC: num("modelDrawWhPerC") ?? DEFAULT_DRAW_WH_PER_C,
           showerWh: num("modelShowerWh") ?? DEFAULT_SHOWER_WH,
+          minPerDegC: num("modelMinPerDegC") ?? DEFAULT_MIN_PER_DEG_C,
           anchored: ctx.state.get("modelAnchored") === true,
         };
 

@@ -31,6 +31,8 @@ Une fois la coupure constatée, la recette pose un verrou « ballon plein ». Sa
 - **avec une sonde vivante** — `tankFullMemory`, 12 h par défaut. La sonde est relue à chaque tick contre la température enregistrée au moment de la coupure : un puisage fait chuter le bas du ballon de plusieurs degrés et libère le verrou immédiatement, les pertes statiques finissent par le libérer toutes seules. C'est ce qui évite de refermer le relais à 3 h du matin sur un ballon que le soleil a porté au thermostat à 15 h ;
 - **sans sonde, ou sonde périmée** — 2 h, comme avant. Plus rien ne contredit le verrou, donc il expire à l'aveugle. La recette préfère chauffer un ballon déjà chaud (le thermostat la coupe en quelques minutes) que sauter un cycle sur une hypothèse que personne ne vérifie.
 
+- **relais fermé sans aucune consommation** (v0.20) — 60 min, fixe. Le thermostat était encore ouvert (typiquement dans son différentiel après la coupure de la nuit) : ça prouve « chaud », pas « plein ». Le 2026-10-06 deux accords de surplus (11 h 20 et 12 h 18) ont fermé le relais sur 0 W, et le premier avait verrouillé le ballon pour 12 h. Journal : « Thermostat encore ouvert — nouvel essai dans 60 min ». Un tel refus **ne compte pas non plus comme cycle complet** : il ne remet plus à zéro l'horloge de `fullCycleEveryDays` (le 2026-10-06 un refus à 0 W l'avait repoussé de cinq jours). Seule une coupure après une vraie consommation la fait avancer.
+
 L'échéance est publiée dans l'état de l'instance (`tankFullUntil`) : un cycle nocturne sauté est la chose la plus surprenante que fasse cette mémoire, elle dit donc quand elle s'arrête.
 
 ### La mesure doit d'abord faire ses preuves
@@ -177,6 +179,25 @@ Mettre **0** rend le comportement d'avant : demander dès que le ballon n'est pa
 ### Ce que publie l'instance
 
 `surplusClaim` (`pending` / `granted` / la raison du refus), `deficitWh` et `surplusMinDeficitWh` (ce qui manque au ballon, et à partir de quand ça vaut une demande), `availableSurplus` (le surplus disponible vu par l'arbitre), `surplusSlack` et `surplusDrawing` (ce que la recette a déclaré en dernier à l'arbitre — c'est la différence entre « accordé » et « accordé, à l'arrêt » sur la surface d'arbitrage). Les anciens `surplus`, `solarStartAt` et `solarStopAt` ont disparu avec les seuils : « pourquoi ça ne chauffe pas en plein soleil ? » se lit maintenant sur une ligne, et le détail complet est dans le journal des décisions de **Énergie → En direct**.
+
+## Soleil, soir et séjours (v0.20)
+
+Tous ces réglages sont facultatifs : **laissés vides, la recette se comporte exactement comme en v0.19.**
+
+| Réglage | Groupe | Effet |
+| --- | --- | --- |
+| **Soleil dès kWh** (`sunnyDayKwh`) | Surplus solaire | Seuil de prévision PV (spec 160 du cœur, lue sur le compteur de production) qui fait d'une journée une « journée solaire ». Vide = désactivé. |
+| **Nuit si soleil** (`nightChargeSunny`, 80 %) | Surplus solaire | Si la journée qui vient est solaire, le cycle HC vise cette charge du modèle au lieu du thermostat, calé en fin de plage, puis s'arrête (« Charge de nuit atteinte (80 %) — le soleil finira »). |
+| **Mini le soir** (`rescueChargeEvening`) | Chauffe de secours | Charge mini entre « Soir dès » et le début des heures creuses. Vide = la charge mini de la journée. |
+| **Soir dès** (`eveningFrom`, 17:00) | Chauffe de secours | Début de la période du soir. |
+| **Séjours du gîte** (`guestStays`) | Séjours du gîte | L'équipement GuestFlow (`occupied`, `arrival`, `departure`). Un séjour est actif de `arrival − 6 h` à `departure`, ou tant que `occupied` est vrai. |
+| **Hausse en séjour** (`guestBoost`, 15 pts) | Séjours du gîte | Pendant un séjour, toutes les charges (mini jour et soir, visée du secours, visée de nuit) montent d'autant, plafonnées à 100 %. Une nuit sans soleil avant une arrivée est une nuit pleine. |
+
+La journée qui compte pour la nuit est **demain avant minuit, aujourd'hui après** (bascule à midi). Sans prévision PV lisible (modèle du cœur encore provisoire), la nuit retombe sur la v0.19, avec `j1_condition` en secours.
+
+**Cycle complet sur le jour le plus ensoleillé** : avec un seuil solaire, le cycle de `fullCycleEveryDays` peut glisser de ±2 jours autour de son échéance, sur le jour le plus ensoleillé qui atteint le seuil (égalité → le plus tôt). L'énergie des jours J+2 à J+4 vient de l'irradiance `irradiance_120h` de l'équipement de prévision, mise à l'échelle par le rapport kWh/irradiation des jours que le cœur prévoit. Si c'est aujourd'hui, la demande de surplus va jusqu'au thermostat sans le seuil « Surplus dès » ; sinon les nuits d'avant ne sont pas forcées. Aucun jour solaire, ou échéance + 2 dépassée → nuit pleine comme avant. Recalculé toutes les heures.
+
+Ligne de la carte : `Charge 52 % · sonde 48 °C · Nuit : jusqu'à 80 % (soleil 11 kWh) · Cycle complet : jeudi`, plus `· Séjour : +15 pts` pendant un séjour. État publié : `nightPlan`, `nightTarget`, `pvForecastKwh`, `fullCyclePlan`, `fullCycleKwh`, `forecastDaysKwh`, `guestActive`, `floorNow`, `chargeUpTo`, `eveningFloor`.
 
 ## Modes
 

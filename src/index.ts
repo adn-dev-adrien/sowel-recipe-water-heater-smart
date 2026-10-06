@@ -429,6 +429,94 @@ const DEFAULT_IMPORT_TOLERANCE_RATIO = 0.1;
  *  enough to going cold that the watts are not negotiable. */
 const FLOOR_URGENCY_MARGIN_C = 5;
 
+/**
+ * How long a relay closed onto an *open* thermostat keeps the recipe away.
+ *
+ * Not `tankFullMemory`. That memory is the right answer to a cut-off after a
+ * real draw — the tank reached its setpoint, and the probe watches it from
+ * there. A cycle that never pulled a watt proves something much weaker: the
+ * thermostat is still inside its differential, typically because the night
+ * cycle stopped right on its cut-off a few hours earlier. On 2026-10-06 the
+ * arbiter granted the surplus at 11:20 and again at 12:18 (Paris); both times
+ * the relay closed and the heater drew 0 W, grid meter and heater clamp
+ * agreeing — the night cycle had been stopped at 06:04, right at its cut-off.
+ * The first refusal latched "tank full" for twelve hours, and a sunny afternoon
+ * went to the grid instead of the tank.
+ *
+ * An hour is long enough for standing loss and the morning's draws to walk the
+ * thermostat back through its reset point, and short enough to catch most of a
+ * day's surplus. Fixed rather than a slot: there is no household decision in
+ * it, only a property of a mechanical thermostat.
+ */
+const REFUSAL_RETRY_MS = 60 * 60 * 1000;
+
+/**
+ * Where the forecast for "the coming daylight" switches from today to tomorrow.
+ *
+ * The night cycle never runs across noon, so any instant before it belongs to
+ * the night that ends this morning (its sun is today's), and any instant after
+ * it belongs to the night that starts this evening (its sun is tomorrow's).
+ * Midnight would be the literal boundary, but it would show the wrong day's
+ * figure all afternoon on the card, and decide nothing differently at night.
+ */
+const COMING_DAY_SWITCH_MIN = 12 * 60;
+
+/** Margin added to the solar-night duration — the same asymmetry as the
+ *  thermostat placement: finishing late costs peak-price kWh. */
+const SOLAR_NIGHT_MARGIN_MIN = 20;
+
+/**
+ * How many hours a local day must carry in the irradiance series before its
+ * sum counts.
+ *
+ * The weather plugin publishes from the current hour onwards, so *today* is
+ * always truncated and the last day of the 120 h horizon usually is too. A
+ * truncated day's irradiation cannot be compared with a whole day's kWh, and
+ * a ratio fitted on it would scale every later day by a fraction of the truth.
+ * 20 rather than 24 tolerates a DST day and an hour or two missing at night,
+ * when there is nothing to sum anyway.
+ */
+const MIN_DAY_SERIES_HOURS = 20;
+
+/**
+ * Daily irradiation below which a day says nothing about the array, Wh/m².
+ *
+ * A ratio of two small numbers is noise — the same reasoning as the slope
+ * learner's `LEARN_MIN_SPAN_C`. 300 Wh/m² is a heavily overcast winter day.
+ */
+const MIN_DAY_IRRADIATION_WH = 300;
+
+/** How far either side of the due date the full cycle may move, in days. */
+const FULL_CYCLE_SHIFT_DAYS = 2;
+/** The irradiance horizon: today plus four days. */
+const FORECAST_HORIZON_DAYS = 5;
+/** The full-cycle plan is recomputed this often — the forecast moves hourly. */
+const FULL_CYCLE_PLAN_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Guests are counted as present this long before their arrival.
+ *
+ * The point of raising the levels is to have the tank full when they walk in,
+ * and a cold tank needs a few hours of resistor to get there — two hours at
+ * 2.2 kW is most of a 200 L tank. Six hours leaves room for the surplus to do
+ * it before any of it has to be bought.
+ */
+const GUEST_LEAD_MS = 6 * 60 * 60 * 1000;
+
+const WEEKDAYS_FR = ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"];
+
+/** Aliases the GuestFlow stays equipment publishes. */
+const GUEST_OCCUPIED_ALIAS = "occupied";
+const GUEST_ARRIVAL_ALIAS = "arrival";
+const GUEST_DEPARTURE_ALIAS = "departure";
+
+/** Where the weather plugin puts its hourly irradiance (core spec 160). */
+const IRRADIANCE_ALIAS = "irradiance_120h";
+/** What the core forecaster publishes on the production meter (spec 160).
+ *  Absent while its model is provisional — which is "no forecast", not 0. */
+const PV_TODAY_ALIAS = "pv_forecast_today_kwh";
+const PV_TOMORROW_ALIAS = "pv_forecast_tomorrow_kwh";
+
 type Reason = "floor" | "hc" | "solar" | "boost";
 type Mode = "auto" | "boost" | "off";
 
@@ -955,6 +1043,14 @@ export function computeSlack(input: {
   return "some";
 }
 
+/** kWh for the journal and the card: whole above 10, one decimal below. */
+function fmtKwh(v: number | null): string {
+  if (v === null) return "?";
+  if (v >= 10) return String(Math.round(v));
+  const r = Math.round(v * 10) / 10;
+  return Number.isInteger(r) ? String(r) : r.toFixed(1);
+}
+
 /** One decimal, or null — the state is read by humans. */
 function round1(v: number | null): number | null {
   return v === null ? null : Math.round(v * 10) / 10;
@@ -977,6 +1073,285 @@ function isOnValue(value: unknown): boolean {
 
 function nowMinutes(now: Date): number {
   return now.getHours() * 60 + now.getMinutes();
+}
+
+// ============================================================
+// Solar-aware planning (v0.20) — pure helpers, exported for tests
+// ============================================================
+
+/**
+ * Local calendar day of an instant, `YYYY-MM-DD`, in the runtime's time zone.
+ *
+ * The same convention as `nowMinutes` and as the core forecaster, which cuts
+ * `pv_forecast_today_kwh` on the server's local midnight: the VM runs in
+ * Europe/Paris, so a "day" here is a Paris day on both sides of the contract.
+ */
+export function localDayKey(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate(),
+  ).padStart(2, "0")}`;
+}
+
+/** Local midnight `offset` days after the day of `ms`. `setDate`, not
+ *  `+86_400_000`: a DST day is 23 or 25 hours long. */
+export function localMidnight(ms: number, offset = 0): number {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + offset);
+  return d.getTime();
+}
+
+/** Whole local days from the day of `fromMs` to the day of `toMs`. */
+export function localDayDiff(fromMs: number, toMs: number): number {
+  return Math.round((localMidnight(toMs) - localMidnight(fromMs)) / 86_400_000);
+}
+
+export interface IrradianceHourLite {
+  /** Start of the hour, ISO UTC. */
+  t: string;
+  /** W/m² averaged over the hour — so also Wh/m² for that hour. */
+  direct?: number | null;
+  diffuse?: number | null;
+}
+
+/**
+ * Read the weather plugin's `irradiance_120h` value.
+ *
+ * `{issuedAt, model, hours: [{t, direct, diffuse, temp}]}`. Accepts the object
+ * or its JSON text — a json binding may arrive either way depending on how the
+ * device data point was stored. Anything else is `null`: no series.
+ */
+export function parseIrradianceSeries(value: unknown): IrradianceHourLite[] | null {
+  let v = value;
+  if (typeof v === "string") {
+    try {
+      v = JSON.parse(v);
+    } catch {
+      return null;
+    }
+  }
+  if (!v || typeof v !== "object") return null;
+  const hours = (v as { hours?: unknown }).hours;
+  if (!Array.isArray(hours)) return null;
+  return hours.filter(
+    (h): h is IrradianceHourLite =>
+      !!h && typeof h === "object" && typeof (h as { t?: unknown }).t === "string",
+  );
+}
+
+/** Σ(direct + diffuse) per local day, Wh/m², with the number of hours summed. */
+export function dailyIrradiation(
+  hours: IrradianceHourLite[],
+): Map<string, { wh: number; hours: number }> {
+  const out = new Map<string, { wh: number; hours: number }>();
+  for (const h of hours) {
+    const at = Date.parse(h.t);
+    if (!Number.isFinite(at)) continue;
+    const direct = toNumber(h.direct);
+    const diffuse = toNumber(h.diffuse);
+    if (direct === null && diffuse === null) continue;
+    const key = localDayKey(at);
+    const day = out.get(key) ?? { wh: 0, hours: 0 };
+    day.wh += Math.max(0, direct ?? 0) + Math.max(0, diffuse ?? 0);
+    day.hours += 1;
+    out.set(key, day);
+  }
+  return out;
+}
+
+/**
+ * Expected PV energy for today and the four following days, kWh.
+ *
+ * The core forecasts two days (spec 160) and it is the better source for them:
+ * its model is fitted on this array's own production. Beyond that the only
+ * input is the weather plugin's irradiance, which is the right *shape* and the
+ * wrong unit. So the days the core does forecast set the exchange rate — kWh
+ * per Wh/m² of irradiation — and the later days borrow it. Every ratio that can
+ * be computed honestly is averaged; one that cannot (a truncated day, a day
+ * too dark to divide by) is left out rather than guessed.
+ *
+ * Index 0 is today. `null` means "no figure", and the planner treats it as a
+ * day that cannot be chosen — never as a sunless one.
+ */
+export function forecastDayEnergies(input: {
+  now: number;
+  todayKwh: number | null;
+  tomorrowKwh: number | null;
+  series: IrradianceHourLite[] | null;
+}): (number | null)[] {
+  const out: (number | null)[] = new Array(FORECAST_HORIZON_DAYS).fill(null);
+  out[0] = input.todayKwh;
+  out[1] = input.tomorrowKwh;
+  if (!input.series) return out;
+
+  const irradiation = dailyIrradiation(input.series);
+  const dayOf = (offset: number) =>
+    irradiation.get(localDayKey(localMidnight(input.now, offset)));
+
+  const ratios: number[] = [];
+  for (const offset of [0, 1]) {
+    const kwh = out[offset];
+    const day = dayOf(offset);
+    if (kwh === null || kwh < 0 || !day) continue;
+    if (day.hours < MIN_DAY_SERIES_HOURS || day.wh < MIN_DAY_IRRADIATION_WH) continue;
+    ratios.push(kwh / day.wh);
+  }
+  if (ratios.length === 0) return out;
+  const ratio = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+
+  for (let offset = 2; offset < FORECAST_HORIZON_DAYS; offset++) {
+    const day = dayOf(offset);
+    if (!day || day.hours < MIN_DAY_SERIES_HOURS) continue;
+    out[offset] = Math.round(day.wh * ratio * 10) / 10;
+  }
+  return out;
+}
+
+/**
+ * Which day should carry the periodic full cycle, as an offset from today.
+ *
+ * The cycle is due on day `dueOffset` (negative once overdue). It may move by
+ * `FULL_CYCLE_SHIFT_DAYS` either way, inside the forecast horizon and no
+ * earlier than `firstOffset` — today stops being a candidate once its sun is
+ * spent. Among those, the day with the most forecast energy wins, provided it
+ * reaches `sunnyDayKwh`; ties go to the earliest, because a cycle done is a
+ * cycle that cannot be lost to the next forecast revision.
+ *
+ * `null` means no sunny candidate: the caller falls back to the full night,
+ * exactly as before v0.20.
+ */
+export function chooseFullCycleDay(
+  dayKwh: (number | null)[],
+  dueOffset: number,
+  sunnyDayKwh: number,
+  firstOffset = 0,
+): number | null {
+  const from = Math.max(firstOffset, dueOffset - FULL_CYCLE_SHIFT_DAYS);
+  const to = Math.min(dayKwh.length - 1, dueOffset + FULL_CYCLE_SHIFT_DAYS);
+  let best: number | null = null;
+  for (let i = from; i <= to; i++) {
+    const kwh = dayKwh[i];
+    if (kwh === null || kwh === undefined || kwh < sunnyDayKwh) continue;
+    if (best === null || kwh > (dayKwh[best] as number)) best = i;
+  }
+  return best;
+}
+
+/** "aujourd'hui", "demain", then the weekday — the card's wording for a day. */
+export function dayLabelFr(now: number, offset: number): string {
+  if (offset === 0) return "aujourd'hui";
+  if (offset === 1) return "demain";
+  return WEEKDAYS_FR[new Date(localMidnight(now, offset)).getDay()]!;
+}
+
+/**
+ * The charge floor in force at a given minute of the day.
+ *
+ * Showers cluster in the evening, and the evening is also the one stretch with
+ * neither sun nor cheap tariff ahead of it until the night window opens: a tank
+ * that runs low at 19:00 has nothing coming to rescue it but peak-price kWh.
+ * The morning is the opposite — the sun follows. So the evening, from
+ * `eveningFrom` to the start of the off-peak window, holds a higher floor.
+ *
+ * Without an off-peak window the evening runs to midnight. An off-peak window
+ * that opens *before* `eveningFrom` (more than twelve hours "later" on the
+ * clock) leaves no evening at all: the cheap hours already cover it.
+ */
+export function chargeFloorAt(
+  nowMin: number,
+  opts: {
+    eveningFromMin: number;
+    offPeakStartMin: number | null;
+    dayFloor: number;
+    eveningFloor: number;
+  },
+): { floor: number; evening: boolean } {
+  const end = opts.offPeakStartMin ?? 0;
+  const evening =
+    end !== opts.eveningFromMin &&
+    windowLength(opts.eveningFromMin, end) <= 12 * 60 &&
+    isWithinWindow(nowMin, opts.eveningFromMin, end);
+  return { floor: evening ? opts.eveningFloor : opts.dayFloor, evening };
+}
+
+/** What the GuestFlow stays equipment says, parsed. */
+export interface GuestStay {
+  occupied: boolean;
+  /** Epoch ms, or null when absent/unreadable. */
+  arrival: number | null;
+  departure: number | null;
+}
+
+/**
+ * Whether a stay touches the interval `[fromMs, toMs)`.
+ *
+ * A stay runs from `arrival − GUEST_LEAD_MS` to `departure`, or for as long as
+ * GuestFlow says the gîte is occupied — whichever is wider, because the two
+ * fail differently: dates can be missing, and `occupied` only turns true once
+ * the guests are in. Without a departure the window closes at the arrival and
+ * `occupied` carries the rest.
+ */
+export function guestStayOverlaps(
+  stay: GuestStay | null,
+  fromMs: number,
+  toMs: number,
+  leadMs: number = GUEST_LEAD_MS,
+): boolean {
+  if (!stay) return false;
+  if (stay.occupied) return true;
+  if (stay.arrival === null) return false;
+  const start = stay.arrival - leadMs;
+  const end = stay.departure ?? stay.arrival;
+  return start < toMs && end > fromMs;
+}
+
+/** Whether a stay is active right now. */
+export function guestStayActive(stay: GuestStay | null, now: number, leadMs?: number): boolean {
+  return guestStayOverlaps(stay, now, now + 1, leadMs);
+}
+
+/**
+ * Raise a charge level by the guest boost, capped at 100 %.
+ *
+ * A level of 0 is a disabled level, not a low one, and stays disabled: guests
+ * must not switch on a rescue the household turned off.
+ */
+export function raiseLevel(fraction: number, boostPts: number): number {
+  if (fraction <= 0 || boostPts <= 0) return fraction;
+  return Math.min(1, fraction + boostPts / 100);
+}
+
+/**
+ * Tonight's charge target when the coming day is sunny, or `null` for "fill to
+ * the thermostat as before".
+ *
+ * Null on every missing input — no threshold, no forecast — which is what keeps
+ * an instance that never set `sunnyDayKwh` on v0.19 behaviour.
+ */
+export function nightTargetFraction(input: {
+  forecastKwh: number | null;
+  sunnyDayKwh: number | null;
+  nightChargePct: number;
+  boostPts: number;
+}): number | null {
+  if (input.sunnyDayKwh === null || input.forecastKwh === null) return null;
+  if (input.forecastKwh < input.sunnyDayKwh) return null;
+  return Math.min(1, (input.nightChargePct + Math.max(0, input.boostPts)) / 100);
+}
+
+/**
+ * Minutes of resistor needed to lift the stored energy to a target, plus the
+ * placement margin. 0 when the target is already met.
+ *
+ * Energy, not probe distance, because the target *is* an energy: the slope
+ * learner measures the distance to the thermostat, and a solar night stops
+ * well short of it.
+ */
+export function solarNightMinutes(targetWh: number, storedWh: number, heaterW: number): number {
+  const missing = targetWh - storedWh;
+  if (missing <= 0 || heaterW <= 0) return 0;
+  return Math.ceil((missing / heaterW) * 60) + SOLAR_NIGHT_MARGIN_MIN;
 }
 
 // ============================================================
@@ -1058,6 +1433,24 @@ function buildSlots(): RecipeSlotDef[] {
       required: false,
       defaultValue: 65,
       constraints: { min: 5, max: 100 },
+      group: "floor",
+    },
+    {
+      id: "rescueChargeEvening",
+      name: "Evening floor",
+      description: "Blank = charge floor",
+      type: "number",
+      required: false,
+      constraints: { min: 0, max: 95 },
+      group: "floor",
+    },
+    {
+      id: "eveningFrom",
+      name: "Evening from",
+      description: "Until off-peak",
+      type: "time",
+      required: false,
+      defaultValue: "17:00",
       group: "floor",
     },
 
@@ -1164,6 +1557,25 @@ function buildSlots(): RecipeSlotDef[] {
       group: "solar",
     },
     {
+      id: "sunnyDayKwh",
+      name: "Sunny from kWh",
+      description: "Blank = off",
+      type: "number",
+      required: false,
+      constraints: { min: 0.1, max: 200 },
+      group: "solar",
+    },
+    {
+      id: "nightChargeSunny",
+      name: "Sunny night",
+      description: "Charge target (%)",
+      type: "number",
+      required: false,
+      defaultValue: 80,
+      constraints: { min: 10, max: 100 },
+      group: "solar",
+    },
+    {
       id: "gridEquipment",
       name: "House meter",
       description: "Cut-off fallback",
@@ -1237,6 +1649,27 @@ function buildSlots(): RecipeSlotDef[] {
       defaultValue: 70,
       constraints: { min: 0, max: 500 },
       group: "tank",
+    },
+    {
+      // No type constraint on purpose: GuestFlow's stays equipment is whatever
+      // type its owner gave it, and the recipe only reads three aliases.
+      id: "guestStays",
+      name: "Guest stays",
+      description: "GuestFlow stays equipment",
+      type: "equipment",
+      required: false,
+      constraints: { crossZone: true },
+      group: "guests",
+    },
+    {
+      id: "guestBoost",
+      name: "Boost during stay",
+      description: "Charge points added",
+      type: "number",
+      required: false,
+      defaultValue: 15,
+      constraints: { min: 0, max: 50 },
+      group: "guests",
     },
     {
       id: "maxCycle",
@@ -1362,6 +1795,30 @@ const FR: RecipeLangPack = {
       name: "Chauffe maxi",
       description: "Garde-fou",
     },
+    rescueChargeEvening: {
+      name: "Mini le soir",
+      description: "Vide = charge mini",
+    },
+    eveningFrom: {
+      name: "Soir d\u00e8s",
+      description: "Jusqu'aux HC",
+    },
+    sunnyDayKwh: {
+      name: "Soleil d\u00e8s kWh",
+      description: "Vide = d\u00e9sactiv\u00e9",
+    },
+    nightChargeSunny: {
+      name: "Nuit si soleil",
+      description: "Charge vis\u00e9e (%)",
+    },
+    guestStays: {
+      name: "S\u00e9jours du g\u00eete",
+      description: "\u00c9quipement GuestFlow",
+    },
+    guestBoost: {
+      name: "Hausse en s\u00e9jour",
+      description: "Points de charge en plus",
+    },
   },
   groups: {
     main: "\u00c9quipement",
@@ -1370,6 +1827,7 @@ const FR: RecipeLangPack = {
     tank: "Mod\u00e8le de charge du ballon",
     solar: "Surplus solaire",
     cutoff: "Ballon plein : d\u00e9tection et m\u00e9moire",
+    guests: "S\u00e9jours du g\u00eete",
     advanced: "R\u00e9glages avanc\u00e9s",
   },
 };
@@ -1445,6 +1903,48 @@ export function createRecipe(): RecipeDefinition {
       const rescueChargeUpTo = toNumber(params.rescueChargeUpTo) ?? 65;
       if (rescueCharge > 0 && rescueChargeUpTo <= rescueCharge) {
         throw new Error("Recovery charge must be above the rescue charge threshold");
+      }
+
+      // v0.20. Every check below is skipped when its slot is empty, so a form
+      // saved under v0.19 validates exactly as it did.
+      const rescueChargeEvening = toNumber(params.rescueChargeEvening);
+      if (rescueChargeEvening !== null) {
+        if (rescueChargeEvening < rescueCharge) {
+          throw new Error("The evening charge floor must be at least the charge floor");
+        }
+        if (rescueChargeEvening > 0 && rescueChargeUpTo <= rescueChargeEvening) {
+          throw new Error("Recovery charge must be above the evening charge floor");
+        }
+      }
+      const eveningFrom = params.eveningFrom;
+      if (
+        eveningFrom !== undefined &&
+        eveningFrom !== null &&
+        eveningFrom !== "" &&
+        !isValidHHMM(eveningFrom)
+      ) {
+        throw new Error("Evening start must be a time like 17:00");
+      }
+      const sunnyDayKwh = toNumber(params.sunnyDayKwh);
+      if (sunnyDayKwh !== null) {
+        if (sunnyDayKwh <= 0) throw new Error("The sunny-day threshold must be above 0 kWh");
+        // The night target only exists with a threshold, so it is only checked
+        // with one: a v0.19 form carrying a 90 % floor must not start failing.
+        const nightChargeSunny = toNumber(params.nightChargeSunny) ?? 80;
+        if (nightChargeSunny > 100) {
+          throw new Error("The sunny-night charge target cannot exceed 100 %");
+        }
+        if (nightChargeSunny <= rescueCharge) {
+          throw new Error("The sunny-night charge target must be above the charge floor");
+        }
+      }
+      const guestBoost = toNumber(params.guestBoost);
+      if (guestBoost !== null && (guestBoost < 0 || guestBoost > 50)) {
+        throw new Error("The guest boost must be between 0 and 50 points");
+      }
+      const guestStaysId = params.guestStays ? String(params.guestStays) : "";
+      if (guestStaysId && !ctx.equipmentManager.getById(guestStaysId)) {
+        throw new Error("The selected guest-stays equipment no longer exists");
       }
 
       // Only an alias the user typed can be wrong. Left empty, the binding is
@@ -1546,6 +2046,72 @@ export function createRecipe(): RecipeDefinition {
         return tank.storedWh / capacity < FORECAST_FULL_CHARGE_BELOW;
       }
 
+      /** The condition alone, without the charge gate and without warnings —
+       *  `null` when there is no forecast to read. */
+      function conditionSaysSunless(): boolean | null {
+        if (!forecastId) return null;
+        const condition = readFirstText(
+          ctx.equipmentManager.getByIdWithDetails(forecastId),
+          FORECAST_CONDITION_ALIASES,
+        );
+        return condition === null ? null : !SUNNY_TOMORROW.has(condition);
+      }
+
+      /**
+       * The core's PV forecast for today (0) or tomorrow (1), kWh.
+       *
+       * Computed data on the production meter (spec 160), read through the same
+       * path as any binding. Absent while the core's model is provisional —
+       * and that absence is the whole fallback: no figure, no solar planning.
+       */
+      function pvForecastKwh(offset: 0 | 1): number | null {
+        if (!productionId) return null;
+        const v = readNumeric(
+          ctx.equipmentManager.getByIdWithDetails(productionId),
+          offset === 0 ? PV_TODAY_ALIAS : PV_TOMORROW_ALIAS,
+        );
+        return v !== null && v >= 0 ? v : null;
+      }
+
+      /** The weather plugin's hourly irradiance, or null. */
+      function readIrradiance(): IrradianceHourLite[] | null {
+        if (!forecastId) return null;
+        const eq = ctx.equipmentManager.getByIdWithDetails(forecastId);
+        if (!eq) return null;
+        const raw =
+          eq.dataBindings.find((d) => d.alias === IRRADIANCE_ALIAS)?.value ??
+          eq.computedData?.find((d) => d.alias === IRRADIANCE_ALIAS)?.value;
+        return parseIrradianceSeries(raw);
+      }
+
+      /** GuestFlow's stays equipment, parsed — null when not configured or gone. */
+      function readGuestStay(): GuestStay | null {
+        if (!guestStaysId) return null;
+        const eq = ctx.equipmentManager.getByIdWithDetails(guestStaysId);
+        if (!eq) {
+          warnOnce(
+            "guest-gone",
+            `Équipement de séjours introuvable (${guestStaysId.slice(0, 8)}) — aucune hausse pour les clients`,
+          );
+          return null;
+        }
+        warned.delete("guest-gone");
+        const raw = (alias: string): unknown =>
+          eq.dataBindings.find((d) => d.alias === alias)?.value ??
+          eq.computedData?.find((d) => d.alias === alias)?.value;
+        const time = (v: unknown): number | null => {
+          if (typeof v !== "string" || v.trim() === "") return null;
+          const t = Date.parse(v);
+          return Number.isFinite(t) ? t : null;
+        };
+        const occ = raw(GUEST_OCCUPIED_ALIAS);
+        return {
+          occupied: occ !== undefined && occ !== null && isOnValue(occ),
+          arrival: time(raw(GUEST_ARRIVAL_ALIAS)),
+          departure: time(raw(GUEST_DEPARTURE_ALIAS)),
+        };
+      }
+
       /** Watts the heater is drawing, from whichever channel exists. */
       function readHeaterPowerW(): number | null {
         if (powerMeterId) {
@@ -1594,6 +2160,24 @@ export function createRecipe(): RecipeDefinition {
         TANK_FULL_TTL_MS,
         ctx.helpers.parseDuration(params.tankFullMemory ?? "12h") || 12 * 3600_000,
       );
+
+      // ── v0.20 params. Each one empty means "as in v0.19". ──
+
+      /** The evening floor; empty = the day floor, i.e. one floor all day. */
+      const rescueChargeEveningFraction = Math.max(
+        rescueChargeFraction,
+        (toNumber(params.rescueChargeEvening) ?? rescueChargeFraction * 100) / 100,
+      );
+      const eveningFromMin = hmToMinutes(
+        isValidHHMM(params.eveningFrom) ? params.eveningFrom : "17:00",
+      );
+      /** kWh of forecast PV that make a day "solar". `null` switches parts B
+       *  and C off entirely — the recipe then plans exactly as v0.19 did. */
+      const sunnyDayKwhRaw = toNumber(params.sunnyDayKwh);
+      const sunnyDayKwh = sunnyDayKwhRaw !== null && sunnyDayKwhRaw > 0 ? sunnyDayKwhRaw : null;
+      const nightChargeSunnyPct = Math.max(0, Math.min(100, toNumber(params.nightChargeSunny) ?? 80));
+      const guestStaysId = params.guestStays ? String(params.guestStays) : null;
+      const guestBoostPts = Math.max(0, Math.min(50, toNumber(params.guestBoost) ?? 15));
 
       const hcMode = (["late", "early", "full"] as const).includes(params.hcMode as never)
         ? (params.hcMode as "late" | "early" | "full")
@@ -1717,7 +2301,24 @@ export function createRecipe(): RecipeDefinition {
       let tankFullAt: number | null = null;
       let tankFullTemp: number | null = null;
       let lastFullCycleAt: number | null = null;
+      /**
+       * Persisted: the live latch came from a relay closed onto an open
+       * thermostat, not from a cut-off after a draw. It then lives
+       * `REFUSAL_RETRY_MS`, not `tankFullMemory` — see the constant.
+       */
+      let tankFullRefused = false;
       let mode: Mode = "auto";
+
+      /** v0.20 — the solar night reached its target this off-peak window, so
+       *  the cycle stays stopped until the window closes, instead of
+       *  restarting on the first watt-hour of standing loss. */
+      let nightTargetReached = false;
+      /** Last journal labels, so a plan is logged when it changes, not hourly. */
+      let lastNightLabel: string | null = null;
+      let lastFullCycleLabel: string | null = null;
+      let lastGuestActive: boolean | null = null;
+      /** The full-cycle plan, recomputed hourly or when its inputs move. */
+      let fullCyclePlanCache: { at: number; key: string; plan: FullCyclePlan } | null = null;
 
       /** The surplus reservation held with the core arbiter, if any. */
       let claim: CapacityClaimHandle | null = null;
@@ -1887,19 +2488,30 @@ export function createRecipe(): RecipeDefinition {
         tankFull = true;
         tankFullAt = now;
         tankFullTemp = temp;
-        lastFullCycleAt = now;
+        tankFullRefused = !drew;
 
         // A thermostat that was already open when we closed the relay teaches
-        // nothing about capacity, duration or coefficients. Latch, say so, stop.
+        // nothing about capacity, duration or coefficients — and it is not a
+        // full cycle either. Latch briefly, say so, stop.
+        //
+        // `lastFullCycleAt` used to be set above this line, for both cases. On
+        // 2026-10-06 at 10:24Z a 0 W refusal on a surplus grant stamped it, and
+        // pushed the next periodic full cycle five days out: the anti-
+        // legionella clock was reset by a relay that never let a watt through.
+        // Only a cut-off after a real draw proves the whole tank reached its
+        // setpoint, so only that one may move the clock.
         if (!drew) {
           const held = cycleStartedAt !== null ? Math.round((endedAt - cycleStartedAt) / 60000) : 0;
           ctx.log(
-            `Thermostat déjà ouvert (relais fermé ${held} min sans consommation) — ballon chaud, modèle inchangé`,
+            `Thermostat encore ouvert — nouvel essai dans ${Math.round(
+              REFUSAL_RETRY_MS / 60000,
+            )} min (relais fermé ${held} min sans consommation, modèle inchangé)`,
           );
           storedAtCycleStart = null;
           persist();
           return;
         }
+        lastFullCycleAt = now;
 
         // Read before anchoring: the anchor overwrites both of these.
         const capacityAtStart = tankCapacityWh(tankVolumeL, tank);
@@ -2034,13 +2646,24 @@ export function createRecipe(): RecipeDefinition {
        * hot tank (the thermostat cuts it off in minutes) than skip a cycle on
        * an assumption nothing is checking.
        */
+      /** How long the live latch lives: a refusal retries within the hour, a
+       *  real cut-off keeps the v0.19 rule (memory with a probe, blind TTL
+       *  without). */
+      function latchTtlMs(corroborated: boolean): number {
+        if (tankFullRefused) return REFUSAL_RETRY_MS;
+        return corroborated ? tankFullMemoryMs : TANK_FULL_TTL_MS;
+      }
+
       function isTankFull(temp: number | null, now: number): boolean {
         if (!tankFull || tankFullAt === null) return false;
         const corroborated = temp !== null && tankFullTemp !== null;
-        const ttl = corroborated ? tankFullMemoryMs : TANK_FULL_TTL_MS;
+        const ttl = latchTtlMs(corroborated);
         if (now - tankFullAt > ttl) {
           tankFull = false;
-          if (corroborated) {
+          if (tankFullRefused) {
+            tankFullRefused = false;
+            ctx.log("Nouvel essai : le thermostat a peut-être refermé");
+          } else if (corroborated) {
             ctx.log(
               `Ballon chaud depuis ${ctx.helpers.formatDuration(
                 now - tankFullAt,
@@ -2051,6 +2674,7 @@ export function createRecipe(): RecipeDefinition {
         }
         if (corroborated && (temp as number) <= (tankFullTemp as number) - DRAW_OFF_DELTA_C) {
           tankFull = false;
+          tankFullRefused = false;
           ctx.log(`Puisage détecté (${(temp as number).toFixed(1)} °C) — ballon considéré non plein`);
           return false;
         }
@@ -2176,13 +2800,215 @@ export function createRecipe(): RecipeDefinition {
         return estimateHeatMinutes(tank, temp) ?? hcEstimateMin;
       }
 
-      function hcHeatWindow(now: number, temp: number | null): { startMin: number; endMin: number } | null {
+      // ── Solar-aware planning (v0.20) ──────────────────────
+
+      /**
+       * Where the periodic full cycle goes.
+       *
+       * Before v0.20 it was a night, always: the first off-peak window after
+       * `fullCycleEveryDays` had elapsed. A sunny day two days later could have
+       * done the same job for free, and the panels' surplus is exactly what this
+       * tank is for. So with a sunny-day threshold set, the cycle may move to
+       * the sunniest day within two days of its due date, and the nights before
+       * that day are left alone. Without one — or without any forecast to read —
+       * this collapses to the v0.19 rule, `forceNight` = overdue.
+       */
+      interface FullCyclePlan {
+        /** Offset from today of the chosen sunny day, or null. */
+        day: number | null;
+        /** That day's forecast, kWh. */
+        kwh: number | null;
+        /** Tonight's off-peak window must be a full one. */
+        forceNight: boolean;
+      }
+
+      /**
+       * What tonight's off-peak window aims at.
+       *
+       *  - `solar`: the coming day is sunny, so the night only brings the
+       *    modelled charge to `target` and the panels finish the tank;
+       *  - `full`: the whole window, for the periodic cycle, for a sunless day
+       *    on a tank that is not nearly full, or for a sunless day guests
+       *    arrive on;
+       *  - `thermostat`: v0.19's placement — late, sized on the probe, to the
+       *    thermostat cut-off.
+       */
+      interface NightPlan {
+        kind: "solar" | "full" | "thermostat";
+        target: number | null;
+        /** Core PV forecast for the coming daylight, when read. */
+        forecastKwh: number | null;
+        why: "cycle" | "guests" | "sunless" | null;
+      }
+
+      function fullCyclePlan(now: number, nowMin: number): FullCyclePlan {
+        if (fullCycleEveryDays <= 0) return { day: null, kwh: null, forceNight: false };
+        const overdue = needsFullCycle(now);
+        if (sunnyDayKwh === null) return { day: null, kwh: null, forceNight: overdue };
+
+        // Today stays a candidate until the evening: past `eveningFrom` its
+        // sun is spent, and choosing it would only postpone the fallback night.
+        const first = nowMin < eveningFromMin ? 0 : 1;
+        const key = `${lastFullCycleAt}|${localDayKey(now)}|${first}`;
+        if (
+          fullCyclePlanCache &&
+          fullCyclePlanCache.key === key &&
+          now - fullCyclePlanCache.at < FULL_CYCLE_PLAN_TTL_MS
+        ) {
+          return fullCyclePlanCache.plan;
+        }
+
+        const days = forecastDayEnergies({
+          now,
+          todayKwh: pvForecastKwh(0),
+          tomorrowKwh: pvForecastKwh(1),
+          series: readIrradiance(),
+        });
+        const dueAt =
+          lastFullCycleAt === null ? now : lastFullCycleAt + fullCycleEveryDays * 86_400_000;
+        const day = chooseFullCycleDay(days, localDayDiff(now, dueAt), sunnyDayKwh, first);
+        const plan: FullCyclePlan = {
+          day,
+          kwh: day === null ? null : (days[day] ?? null),
+          // A sunny day ahead means the nights before it are not forced. With
+          // none, the v0.19 rule stands — and that also covers "due + 2
+          // reached", which leaves no candidate at all.
+          forceNight: day === null ? overdue : false,
+        };
+        fullCyclePlanCache = { at: now, key, plan };
+        ctx.state.set("forecastDaysKwh", days);
+
+        const label =
+          plan.day !== null
+            ? `Cycle complet placé ${dayLabelFr(now, plan.day)} — ${fmtKwh(plan.kwh)} kWh de solaire prévus`
+            : plan.forceNight
+              ? "Cycle complet cette nuit en heures creuses — aucun jour assez ensoleillé à ±2 jours"
+              : null;
+        if (label !== lastFullCycleLabel) {
+          if (label) ctx.log(label);
+          lastFullCycleLabel = label;
+        }
+        return plan;
+      }
+
+      function computeNightPlan(
+        now: number,
+        nowMin: number,
+        fc: FullCyclePlan,
+        guestActive: boolean,
+      ): NightPlan {
+        const comingOffset = nowMin < COMING_DAY_SWITCH_MIN ? 0 : 1;
+        const pv = sunnyDayKwh !== null ? pvForecastKwh(comingOffset) : null;
+        if (fc.forceNight) return { kind: "full", target: null, forecastKwh: pv, why: "cycle" };
+
+        // The PV forecast replaces the condition wherever it exists: it is this
+        // array's own model, where `sunny` is one word for a whole sky.
+        const sunless = pv !== null ? pv < (sunnyDayKwh as number) : conditionSaysSunless();
+        const capacity = tankCapacityWh(tankVolumeL, tank);
+
+        // Guests arriving on a day the sun will not cover: the cheap window is
+        // the only chance to have the tank full when they walk in, whatever
+        // the charge says now.
+        if (sunless === true && guestStaysId) {
+          const until = localMidnight(now, comingOffset + 1);
+          if (guestStayOverlaps(readGuestStay(), now, until)) {
+            return { kind: "full", target: null, forecastKwh: pv, why: "guests" };
+          }
+        }
+
+        if (pv !== null) {
+          const target = nightTargetFraction({
+            forecastKwh: pv,
+            sunnyDayKwh,
+            nightChargePct: nightChargeSunnyPct,
+            boostPts: guestActive ? guestBoostPts : 0,
+          });
+          if (target !== null) {
+            // An unanchored model has no charge to stop on: heat to the
+            // thermostat, which is also what anchors it.
+            return tank.anchored && capacity > 0
+              ? { kind: "solar", target, forecastKwh: pv, why: null }
+              : { kind: "thermostat", target: null, forecastKwh: pv, why: null };
+          }
+          const low =
+            !tank.anchored || capacity <= 0 || tank.storedWh / capacity < FORECAST_FULL_CHARGE_BELOW;
+          return low
+            ? { kind: "full", target: null, forecastKwh: pv, why: "sunless" }
+            : { kind: "thermostat", target: null, forecastKwh: pv, why: null };
+        }
+
+        // No PV forecast: v0.19 to the letter, `j1_condition` and its warning.
+        return forecastWantsFullNight()
+          ? { kind: "full", target: null, forecastKwh: null, why: "sunless" }
+          : { kind: "thermostat", target: null, forecastKwh: null, why: null };
+      }
+
+      /**
+       * Placement duration for the night plan.
+       *
+       * A solar night is sized on the energy to its target — the probe's
+       * distance to the thermostat is the wrong question when the cycle is not
+       * going there. The probe still caps it: if the thermostat is nearer than
+       * the target, it will cut the cycle first, and a window sized past that
+       * point only starts earlier and cools longer.
+       */
+      function nightHeatMin(temp: number | null, night: NightPlan): number {
+        if (night.kind !== "solar" || night.target === null) return requiredHeatMin(temp);
+        const capacity = tankCapacityWh(tankVolumeL, tank);
+        const byEnergy = solarNightMinutes(night.target * capacity, tank.storedWh, heaterPower());
+        const byProbe = estimateHeatMinutes(tank, temp);
+        return byProbe === null ? byEnergy : Math.min(byEnergy, byProbe);
+      }
+
+      function hcHeatWindow(
+        temp: number | null,
+        night: NightPlan,
+      ): { startMin: number; endMin: number } | null {
         const w = resolveHcWindow();
         announceWindow(w);
         if (!w) return null;
-        const full = needsFullCycle(now) || forecastWantsFullNight();
-        const effective = full ? "full" : hcMode;
-        return computeHcHeatWindow(w.startMin, w.endMin, effective, requiredHeatMin(temp));
+        const effective = night.kind === "full" ? "full" : hcMode;
+        return computeHcHeatWindow(w.startMin, w.endMin, effective, nightHeatMin(temp, night));
+      }
+
+      /** Modelled charge as a fraction, or null before the first anchor. */
+      function currentCharge(): number | null {
+        const capacity = tankCapacityWh(tankVolumeL, tank);
+        return tank.anchored && capacity > 0 ? tank.storedWh / capacity : null;
+      }
+
+      /** Journal lines for plans that changed — once per change, never per tick. */
+      function notePlans(s: Snapshot): void {
+        if (guestStaysId && s.guestActive !== lastGuestActive) {
+          if (lastGuestActive !== null || s.guestActive) {
+            ctx.log(
+              s.guestActive
+                ? `Séjour en cours — niveaux de charge relevés de ${guestBoostPts} pts`
+                : "Fin du séjour — niveaux de charge normaux",
+            );
+          }
+          lastGuestActive = s.guestActive;
+        }
+        if (sunnyDayKwh === null && !guestStaysId) return;
+        const n = s.night;
+        const label =
+          n.kind === "solar"
+            ? `Nuit solaire : charge visée ${Math.round((n.target as number) * 100)} % (${fmtKwh(n.forecastKwh)} kWh de soleil prévus)`
+            : n.kind === "full"
+              ? `Nuit pleine en heures creuses (${
+                  n.why === "cycle"
+                    ? "cycle complet"
+                    : n.why === "guests"
+                      ? "arrivée de clients sans soleil"
+                      : n.forecastKwh !== null
+                        ? `${fmtKwh(n.forecastKwh)} kWh de soleil seulement`
+                        : "pas de soleil prévu"
+                })`
+              : null;
+        if (label !== lastNightLabel) {
+          if (label) ctx.log(label);
+          lastNightLabel = label;
+        }
       }
 
       // ── Decision ──────────────────────────────────────────
@@ -2196,6 +3022,15 @@ export function createRecipe(): RecipeDefinition {
         household: number | null;
         inHc: boolean;
         inHcHeat: boolean;
+        /** v0.20 — the plans and levels in force this tick. */
+        fullCycle: FullCyclePlan;
+        night: NightPlan;
+        guestActive: boolean;
+        /** Charge floor right now (evening or not, guests included). */
+        floor: number;
+        /** Where a charge rescue stops, guests included. */
+        upTo: number;
+        evening: boolean;
       }
 
       /**
@@ -2277,7 +3112,23 @@ export function createRecipe(): RecipeDefinition {
 
         const nMin = nowMinutes(date);
         const hcWindow = resolveHcWindow();
-        const heat = hcHeatWindow(now, temp);
+
+        // v0.20 levels. With every new slot empty they reduce to the v0.19
+        // constants: one floor all day, no boost, no plan beyond "overdue".
+        const guestActive = guestStaysId ? guestStayActive(readGuestStay(), now) : false;
+        const boost = guestActive ? guestBoostPts : 0;
+        const { floor, evening } = chargeFloorAt(nMin, {
+          eveningFromMin,
+          offPeakStartMin: hcWindow?.startMin ?? null,
+          dayFloor: rescueChargeFraction,
+          eveningFloor: rescueChargeEveningFraction,
+        });
+        const floorNow = raiseLevel(floor, boost);
+        const upTo = Math.max(floorNow, raiseLevel(rescueChargeUpToFraction, boost));
+        const fullCycle = fullCyclePlan(now, nMin);
+        const night = computeNightPlan(now, nMin, fullCycle, guestActive);
+
+        const heat = hcHeatWindow(temp, night);
         return {
           now,
           nowMin: nMin,
@@ -2286,6 +3137,12 @@ export function createRecipe(): RecipeDefinition {
           household: power === null && relayOn ? householdPowerW() : null,
           inHc: hcWindow !== null && isWithinWindow(nMin, hcWindow.startMin, hcWindow.endMin),
           inHcHeat: heat !== null && isWithinWindow(nMin, heat.startMin, heat.endMin),
+          fullCycle,
+          night,
+          guestActive,
+          floor: floorNow,
+          upTo,
+          evening,
         };
       }
 
@@ -2341,7 +3198,16 @@ export function createRecipe(): RecipeDefinition {
         //
         // Skipped while the model is unanchored: its deficit is a guess then,
         // and the way to anchor it is to let a cycle reach the thermostat.
-        if (surplusMinShowers > 0 && tank.anchored && deficitWh() < surplusMinDeficitWh()) {
+        //
+        // Not on the day the full cycle was placed on (v0.20): that day's job
+        // is to reach the thermostat on free watts, and a tank one shower short
+        // of full is exactly the tank that must not stop asking.
+        if (
+          surplusMinShowers > 0 &&
+          tank.anchored &&
+          deficitWh() < surplusMinDeficitWh() &&
+          s.fullCycle.day !== 0
+        ) {
           return false;
         }
         return true;
@@ -2412,7 +3278,7 @@ export function createRecipe(): RecipeDefinition {
           mode,
           temp: s.temp,
           minTemp,
-          needsFullCycle: needsFullCycle(s.now),
+          needsFullCycle: s.fullCycle.forceNight || s.fullCycle.day === 0,
           tankFull,
         });
 
@@ -2576,11 +3442,17 @@ export function createRecipe(): RecipeDefinition {
           if (s.temp < minTemp) return "floor";
           if (reason === "floor" && relayOn && s.temp < rescueTemp) return "floor";
         }
-        if (rescueChargeFraction > 0 && tank.anchored && !isTankFull(s.temp, s.now)) {
+        //
+        //    v0.20: the floor follows the clock and the guests (`s.floor`,
+        //    `s.upTo`) — higher from `eveningFrom` to the off-peak start, when
+        //    showers cluster and nothing cheap is coming, and raised by
+        //    `guestBoost` while a stay is on. Both reduce to the v0.19
+        //    constants with their slots empty.
+        if (s.floor > 0 && tank.anchored && !isTankFull(s.temp, s.now)) {
           const capacityWh = tankCapacityWh(tankVolumeL, tank);
           if (capacityWh > 0) {
             const charge = tank.storedWh / capacityWh;
-            const target = reason === "floor" && relayOn ? rescueChargeUpToFraction : rescueChargeFraction;
+            const target = reason === "floor" && relayOn ? s.upTo : s.floor;
             if (charge < target) return "floor";
           }
         }
@@ -2597,7 +3469,23 @@ export function createRecipe(): RecipeDefinition {
         if (isTankFull(s.temp, s.now)) return null;
 
         // 2. Off-peak bulk heating.
-        if (s.inHc && s.inHcHeat) return "hc";
+        //
+        //    On a solar night (v0.20) the cycle stops at its charge target and
+        //    stays stopped for the rest of the window: the panels finish the
+        //    tank tomorrow, and the cheap kWh not bought tonight are the point.
+        //    Latched, because standing loss would otherwise pull the charge a
+        //    hair under the target and restart a 5 min cycle every 10 min.
+        if (s.inHc && s.inHcHeat) {
+          if (s.night.kind !== "solar" || s.night.target === null) return "hc";
+          const charge = currentCharge();
+          if (!nightTargetReached && (charge === null || charge < s.night.target)) return "hc";
+          if (!nightTargetReached) {
+            nightTargetReached = true;
+            ctx.log(
+              `Charge de nuit atteinte (${Math.round(s.night.target * 100)} %) — le soleil finira`,
+            );
+          }
+        }
 
         // 3. Free energy — everywhere the off-peak cycle is not already
         //    running. The guard used to be `!s.inHc`, which silently disabled
@@ -2652,7 +3540,25 @@ export function createRecipe(): RecipeDefinition {
           // window wide open and defeating the late placement. A cycle that ran
           // the whole off-peak window is the best evidence available that the
           // tank was filled; record it as such.
-          if (previous === "hc" && !s.inHcHeat && cycleStartedAt !== null && !powerProven) {
+          //
+          // v0.20 narrows "best evidence" twice. A household witness that is
+          // proven yet never saw the resistor pull during this cycle is proof
+          // of a refusal, not of a fill — the same rule `markTankFull` now
+          // applies, after a 0 W refusal reset the clock on 2026-10-06. And a
+          // solar night is deliberately short of the thermostat, so its end
+          // proves nothing about a full tank.
+          const householdSawNoDraw =
+            householdProven &&
+            cycleHouseholdPeak > 0 && // sampled at all — a mute meter proves nothing
+            cycleHouseholdPeak < heaterPower() * HOUSEHOLD_PROVEN_RATIO;
+          if (
+            previous === "hc" &&
+            !s.inHcHeat &&
+            cycleStartedAt !== null &&
+            !powerProven &&
+            !householdSawNoDraw &&
+            s.night.kind !== "solar"
+          ) {
             lastFullCycleAt = s.now;
           }
           if (
@@ -3058,6 +3964,9 @@ export function createRecipe(): RecipeDefinition {
           updateModel(s);
           detectShowers(s);
           detectCutoff(s);
+          notePlans(s);
+          // The solar-night latch lives for one off-peak window.
+          if (!s.inHc) nightTargetReached = false;
           // After cut-off detection, so a tank that just filled releases its
           // reservation on the same tick rather than sitting on watts the next
           // load in the priority list could use (author rule 4).
@@ -3086,6 +3995,7 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("tankFull", tankFull);
         ctx.state.set("tankFullAt", tankFullAt ? new Date(tankFullAt).toISOString() : null);
         ctx.state.set("tankFullTemp", tankFullTemp);
+        ctx.state.set("tankFullRefused", tankFullRefused);
         ctx.state.set("hcEstimateMin", hcEstimateMin);
         ctx.state.set(
           "lastFullCycleAt",
@@ -3102,7 +4012,7 @@ export function createRecipe(): RecipeDefinition {
       }
 
       function publish(s: Snapshot): void {
-        const heat = hcHeatWindow(s.now, s.temp);
+        const heat = hcHeatWindow(s.temp, s.night);
         // Instrumentation: five nights have started exactly 120 min before the
         // computed placement, and nothing in the code explains it. Publish the
         // resolved slot and the placement every tick — the published label was
@@ -3156,13 +4066,60 @@ export function createRecipe(): RecipeDefinition {
         // deficit in kWh depends on nothing but the balance itself.
         const missingWh = deficitWh();
         const probePart = s.temp !== null ? ` · sonde ${s.temp.toFixed(0)} °C` : "";
+
+        // v0.20 — the plans, for the UI and for the summary below.
+        ctx.state.set("nightPlan", s.night.kind);
+        ctx.state.set(
+          "nightTarget",
+          s.night.target !== null ? Math.round(s.night.target * 100) : null,
+        );
+        ctx.state.set("pvForecastKwh", s.night.forecastKwh);
+        ctx.state.set(
+          "fullCyclePlan",
+          s.fullCycle.day !== null
+            ? localDayKey(localMidnight(s.now, s.fullCycle.day))
+            : s.fullCycle.forceNight
+              ? "night"
+              : null,
+        );
+        ctx.state.set("fullCycleKwh", s.fullCycle.kwh);
+        ctx.state.set("guestActive", s.guestActive);
+        ctx.state.set("floorNow", Math.round(s.floor * 100));
+        ctx.state.set("chargeUpTo", Math.round(s.upTo * 100));
+        ctx.state.set("eveningFloor", s.evening);
+
+        // The segments v0.20 adds to the card line. Each only exists when its
+        // feature is configured and has something to say, so an instance with
+        // every new slot empty keeps the v0.19 line character for character.
+        const extras: string[] = [];
+        if (sunnyDayKwh !== null && s.night.forecastKwh !== null) {
+          const sun = `soleil ${fmtKwh(s.night.forecastKwh)} kWh`;
+          extras.push(
+            s.night.kind === "solar"
+              ? `Nuit : jusqu'à ${Math.round((s.night.target as number) * 100)} % (${sun})`
+              : s.night.kind === "full"
+                ? `Nuit : pleine (${sun})`
+                : `Nuit : jusqu'au thermostat (${sun})`,
+          );
+        }
+        if (sunnyDayKwh !== null && (s.fullCycle.day !== null || s.fullCycle.forceNight)) {
+          extras.push(
+            `Cycle complet : ${
+              s.fullCycle.day !== null ? dayLabelFr(s.now, s.fullCycle.day) : "cette nuit"
+            }`,
+          );
+        }
+        if (s.guestActive && guestBoostPts > 0) extras.push(`Séjour : +${guestBoostPts} pts`);
+
         ctx.state.set(
           "summary",
           charge === null
             ? "Modèle de charge : en attente du premier ancrage"
-            : missingWh < 250
-              ? `Ballon chaud · charge ${charge} %${probePart}`
-              : `Charge ${charge} % · il manque ${(missingWh / 1000).toFixed(1)} kWh${probePart}`,
+            : extras.length > 0
+              ? `Charge ${charge} %${probePart} · ${extras.join(" · ")}`
+              : missingWh < 250
+                ? `Ballon chaud · charge ${charge} %${probePart}`
+                : `Charge ${charge} % · il manque ${(missingWh / 1000).toFixed(1)} kWh${probePart}`,
         );
         ctx.state.set("status", relayOn ? "heating" : manualOn ? "manual" : "off");
         ctx.state.set("reason", reason);
@@ -3189,7 +4146,7 @@ export function createRecipe(): RecipeDefinition {
           "tankFullUntil",
           tankFull && tankFullAt !== null
             ? new Date(
-                tankFullAt + (tankFullTemp !== null ? tankFullMemoryMs : TANK_FULL_TTL_MS),
+                tankFullAt + latchTtlMs(tankFullTemp !== null),
               ).toISOString()
             : null,
         );
@@ -3229,6 +4186,9 @@ export function createRecipe(): RecipeDefinition {
         tankFull = ctx.state.get("tankFull") === true;
         tankFullAt = time("tankFullAt");
         tankFullTemp = num("tankFullTemp");
+        // A refusal latch must survive a restart as a refusal, or the instance
+        // would come back holding a one-hour latch for twelve.
+        tankFullRefused = tankFull && ctx.state.get("tankFullRefused") === true;
         lastFullCycleAt = time("lastFullCycleAt");
 
         const storedEstimate = num("hcEstimateMin");
@@ -3313,6 +4273,26 @@ export function createRecipe(): RecipeDefinition {
             : ""
         }, ${capabilities}`,
       );
+      // v0.20 — one line for what is new, and only when something is set, so
+      // the journal of an instance left on v0.19 settings reads as before.
+      const v20: string[] = [];
+      if (rescueChargeEveningFraction > rescueChargeFraction) {
+        v20.push(
+          `charge mini ${Math.round(rescueChargeEveningFraction * 100)} % le soir dès ${minutesToHm(eveningFromMin)}`,
+        );
+      }
+      if (sunnyDayKwh !== null) {
+        v20.push(
+          `journée solaire dès ${fmtKwh(sunnyDayKwh)} kWh (nuit jusqu'à ${nightChargeSunnyPct} %${
+            productionId ? "" : ", mais aucun compteur de production : prévision illisible"
+          })`,
+        );
+      }
+      if (guestStaysId) {
+        v20.push(`séjours « ${nameOf(guestStaysId)} » (+${guestBoostPts} pts)`);
+      }
+      if (v20.length > 0) ctx.log(`Réglages v0.20 : ${v20.join(", ")}`);
+
       if (!tempAlias()) {
         warnOnce(
           "no-temp",
@@ -3368,6 +4348,7 @@ export function createRecipe(): RecipeDefinition {
             // the tank is re-probed instead of being skipped.
             tankFull = false;
             tankFullAt = null;
+            tankFullRefused = false;
           }
           ctx.log(
             mode === "boost"

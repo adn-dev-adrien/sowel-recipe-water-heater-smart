@@ -14,6 +14,20 @@ import {
   createRecipe,
   resolveBindingAlias,
   computeHcHeatWindow,
+  localDayKey,
+  localMidnight,
+  localDayDiff,
+  parseIrradianceSeries,
+  dailyIrradiation,
+  forecastDayEnergies,
+  chooseFullCycleDay,
+  dayLabelFr,
+  chargeFloorAt,
+  guestStayOverlaps,
+  guestStayActive,
+  raiseLevel,
+  nightTargetFraction,
+  solarNightMinutes,
   pickMainOffPeakSlot,
   findOnOffOrderAlias,
   hmToMinutes,
@@ -32,6 +46,7 @@ const METER = "meter-1";
 const PRODUCTION = "production-1";
 const FORECAST = "forecast-1";
 const BATHROOM = "bathroom-1";
+const GUESTS = "guests-1";
 
 type Binding = {
   alias: string;
@@ -84,6 +99,12 @@ interface HarnessOptions {
   noReportNeed?: boolean;
   /** Makes `reportNeed` throw, to prove a broken core cannot break the tick. */
   reportNeedThrows?: boolean;
+  /** Spec 160 computed data on the production meter; absent = provisional. */
+  pv?: { today?: number; tomorrow?: number };
+  /** `irradiance_120h` on the forecast equipment. */
+  irradiance?: unknown;
+  /** GuestFlow's stays equipment bindings. */
+  guest?: { occupied?: unknown; arrival?: unknown; departure?: unknown };
 }
 
 /**
@@ -160,6 +181,9 @@ function buildHarness(opts: HarnessOptions = {}) {
       status: "online",
       dataBindings: [
         { alias: "j1_condition", category: "weather_condition", value: opts.tomorrow ?? "sunny" },
+        ...(opts.irradiance !== undefined
+          ? [{ alias: "irradiance_120h", value: opts.irradiance }]
+          : []),
       ] as Binding[],
       orderBindings: [],
     },
@@ -169,6 +193,30 @@ function buildHarness(opts: HarnessOptions = {}) {
       type: "energy_production_meter",
       status: "online",
       dataBindings: [{ alias: "power", category: "power", value: 0 }] as Binding[],
+      orderBindings: [],
+      ...(opts.pv
+        ? {
+            computedData: [
+              ...(opts.pv.today !== undefined
+                ? [{ alias: "pv_forecast_today_kwh", value: opts.pv.today }]
+                : []),
+              ...(opts.pv.tomorrow !== undefined
+                ? [{ alias: "pv_forecast_tomorrow_kwh", value: opts.pv.tomorrow }]
+                : []),
+            ],
+          }
+        : {}),
+    },
+    [GUESTS]: {
+      id: GUESTS,
+      name: "Séjours",
+      type: "sensor",
+      status: "online",
+      dataBindings: [
+        { alias: "occupied", value: opts.guest?.occupied ?? false },
+        { alias: "arrival", value: opts.guest?.arrival ?? null },
+        { alias: "departure", value: opts.guest?.departure ?? null },
+      ] as Binding[],
       orderBindings: [],
     },
     [BATHROOM]: {
@@ -1744,7 +1792,10 @@ describe("createInstance", () => {
     // The latch still applies — the thermostat IS open, the tank IS hot, and
     // heating it further would be pointless. That part was never wrong.
     expect(h.state.get("tankFull")).toBe(true);
-    expect(h.logLines.some((l) => l.startsWith("Thermostat déjà ouvert"))).toBe(true);
+    // v0.20: the wording names the retry — the latch is an hour, not 12 h.
+    expect(
+      h.logLines.some((l) => l.startsWith("Thermostat encore ouvert — nouvel essai dans 60 min")),
+    ).toBe(true);
 
     // But nothing was learned from it: the deficit stands, `fullC` is untouched,
     // and no phantom kilowatt-hour was credited for a relay drawing nothing.
@@ -2984,5 +3035,783 @@ describe("form shape", () => {
     for (const slot of createRecipe().slots) {
       expect(fr[slot.id], `missing fr i18n for ${slot.id}`).toBeTruthy();
     }
+  });
+});
+
+// ============================================================
+// v0.20 — solar-aware night, full cycle on the sunniest day, evening floor,
+// guest stays, and the one-hour retry after a refused start
+// ============================================================
+
+/**
+ * An `irradiance_120h` value as the weather plugin publishes it, built on
+ * *local* days so the tests do not depend on the machine's time zone.
+ *
+ * `peaks[d]` is the W/m² held from 08:00 to 18:00 local (11 hours) on day `d`
+ * after `now`'s day, so a day's Σ(direct + diffuse) is `peaks[d] × 11`. Day 0
+ * starts at `now`'s hour, exactly like the real series — truncated.
+ */
+function irradianceSeries(nowIso: string, peaks: number[], lastDayHours = 24) {
+  const now = new Date(nowIso).getTime();
+  const hours: { t: string; direct: number; diffuse: number; temp: number }[] = [];
+  peaks.forEach((peak, d) => {
+    const midnight = localMidnight(now, d);
+    const count = d === peaks.length - 1 ? lastDayHours : 24;
+    for (let hh = 0; hh < count; hh++) {
+      const t = midnight + hh * 3_600_000;
+      if (t < now - 3_600_000) continue;
+      const w = hh >= 8 && hh <= 18 ? peak : 0;
+      hours.push({ t: new Date(t).toISOString(), direct: w * 0.7, diffuse: w * 0.3, temp: 12 });
+    }
+  });
+  return { issuedAt: new Date(now).toISOString(), model: "test", hours };
+}
+
+describe("v0.20 pure helpers", () => {
+  it("counts local days across a month end", () => {
+    const now = new Date("2026-10-30T23:30:00").getTime();
+    expect(localDayKey(now)).toBe("2026-10-30");
+    expect(localDayKey(localMidnight(now, 2))).toBe("2026-11-01");
+    expect(localDayDiff(now, new Date("2026-11-02T00:10:00").getTime())).toBe(3);
+    expect(localDayDiff(now, new Date("2026-10-29T23:59:00").getTime())).toBe(-1);
+  });
+
+  it("parses the irradiance series as an object or as its JSON text", () => {
+    const v = irradianceSeries("2026-10-06T10:00:00", [500, 500]);
+    expect(parseIrradianceSeries(v)?.length).toBe(v.hours.length);
+    expect(parseIrradianceSeries(JSON.stringify(v))?.length).toBe(v.hours.length);
+    expect(parseIrradianceSeries("not json")).toBeNull();
+    expect(parseIrradianceSeries({ hours: "nope" })).toBeNull();
+    expect(parseIrradianceSeries(null)).toBeNull();
+  });
+
+  it("sums direct + diffuse per local day", () => {
+    const v = irradianceSeries("2026-10-06T00:00:00", [500, 900]);
+    const days = dailyIrradiation(parseIrradianceSeries(v)!);
+    expect(days.get("2026-10-06")).toEqual({ wh: 5500, hours: 24 });
+    expect(days.get("2026-10-07")).toEqual({ wh: 9900, hours: 24 });
+  });
+
+  describe("forecastDayEnergies", () => {
+    const now = new Date("2026-10-06T10:00:00").getTime();
+
+    it("scales later days by the kWh/irradiation of tomorrow, ignoring truncated today", () => {
+      // Today starts at 10:00 in the series: 9 of its 11 sunny hours, a
+      // truncated day whose ratio would be wrong — it must be left out.
+      const series = parseIrradianceSeries(
+        irradianceSeries("2026-10-06T10:00:00", [100, 600, 900, 300, 700], 24),
+      );
+      const days = forecastDayEnergies({ now, todayKwh: 3, tomorrowKwh: 12, series });
+      // ratio = 12 / 6600 kWh per Wh/m²
+      expect(days[0]).toBe(3);
+      expect(days[1]).toBe(12);
+      expect(days[2]).toBe(18);
+      expect(days[3]).toBe(6);
+      expect(days[4]).toBe(14);
+    });
+
+    it("averages the ratios of both core days when both are whole", () => {
+      const series = parseIrradianceSeries(
+        irradianceSeries("2026-10-06T00:00:00", [1000, 1000, 1000]),
+      );
+      // 11 kWh and 13 kWh on the same 11000 Wh/m²: average 12 / 11000.
+      const days = forecastDayEnergies({
+        now: new Date("2026-10-06T00:30:00").getTime(),
+        todayKwh: 11,
+        tomorrowKwh: 13,
+        series,
+      });
+      expect(days[2]).toBe(12);
+    });
+
+    it("leaves a day the series truncates, and every later day without a ratio, empty", () => {
+      const truncated = parseIrradianceSeries(
+        irradianceSeries("2026-10-06T10:00:00", [500, 600, 900, 900, 900], 12),
+      );
+      expect(
+        forecastDayEnergies({ now, todayKwh: 3, tomorrowKwh: 12, series: truncated })[4],
+      ).toBeNull();
+      // A tomorrow too dark to divide by gives no ratio at all.
+      const dark = parseIrradianceSeries(irradianceSeries("2026-10-06T10:00:00", [0, 20, 900]));
+      expect(forecastDayEnergies({ now, todayKwh: 0, tomorrowKwh: 0.2, series: dark })[2]).toBeNull();
+      // No core forecast: nothing to scale with.
+      expect(
+        forecastDayEnergies({ now, todayKwh: null, tomorrowKwh: null, series: dark }),
+      ).toEqual([null, null, null, null, null]);
+    });
+  });
+
+  describe("chooseFullCycleDay", () => {
+    it("takes the sunniest day within two days of the due date", () => {
+      expect(chooseFullCycleDay([2, 9, 14, 11, 20], 1, 8)).toBe(2);
+    });
+    it("breaks ties on the earliest day", () => {
+      expect(chooseFullCycleDay([2, 12, 12, 3, 3], 1, 8)).toBe(1);
+    });
+    it("returns null when no candidate reaches the sunny threshold", () => {
+      expect(chooseFullCycleDay([2, 7, 7.9, 3, null], 1, 8)).toBeNull();
+    });
+    it("stays inside the horizon and inside due ± 2", () => {
+      // Due in 5 days: candidates are 3 and 4 only; day 2 is out of range.
+      expect(chooseFullCycleDay([20, 20, 20, 9, null], 5, 8)).toBe(3);
+      // Due in 7: nothing in range yet.
+      expect(chooseFullCycleDay([20, 20, 20, 20, 20], 7, 8)).toBeNull();
+    });
+    it("gives no candidate once due + 2 has passed", () => {
+      expect(chooseFullCycleDay([20, 20, 20, 20, 20], -3, 8)).toBeNull();
+      // Due + 2 is today: today alone remains…
+      expect(chooseFullCycleDay([20, 20, 20, 20, 20], -2, 8)).toBe(0);
+      // …and once today's sun is spent, nothing.
+      expect(chooseFullCycleDay([20, 20, 20, 20, 20], -2, 8, 1)).toBeNull();
+    });
+    it("can choose today", () => {
+      expect(chooseFullCycleDay([15, 9, 10, 2, 2], 0, 8)).toBe(0);
+    });
+  });
+
+  it("names the day the way the card does", () => {
+    const tue = new Date("2026-10-06T10:00:00").getTime(); // a Tuesday
+    expect(dayLabelFr(tue, 0)).toBe("aujourd'hui");
+    expect(dayLabelFr(tue, 1)).toBe("demain");
+    expect(dayLabelFr(tue, 2)).toBe("jeudi");
+  });
+
+  describe("chargeFloorAt", () => {
+    const opts = { eveningFromMin: 17 * 60, offPeakStartMin: 22 * 60, dayFloor: 0.45, eveningFloor: 0.6 };
+    it("switches to the evening floor at eveningFrom and back at the off-peak start", () => {
+      expect(chargeFloorAt(16 * 60 + 59, opts)).toEqual({ floor: 0.45, evening: false });
+      expect(chargeFloorAt(17 * 60, opts)).toEqual({ floor: 0.6, evening: true });
+      expect(chargeFloorAt(21 * 60 + 59, opts)).toEqual({ floor: 0.6, evening: true });
+      expect(chargeFloorAt(22 * 60, opts)).toEqual({ floor: 0.45, evening: false });
+      expect(chargeFloorAt(3 * 60, opts).floor).toBe(0.45);
+    });
+    it("runs the evening to midnight without an off-peak window", () => {
+      const o = { ...opts, offPeakStartMin: null };
+      expect(chargeFloorAt(23 * 60 + 59, o).floor).toBe(0.6);
+      expect(chargeFloorAt(0, o).floor).toBe(0.45);
+    });
+    it("handles an off-peak window starting after midnight", () => {
+      const o = { ...opts, offPeakStartMin: 60 };
+      expect(chargeFloorAt(23 * 60 + 30, o).floor).toBe(0.6);
+      expect(chargeFloorAt(0, o).floor).toBe(0.6);
+      expect(chargeFloorAt(60, o).floor).toBe(0.45);
+    });
+    it("has no evening when the off-peak window opens before it", () => {
+      const o = { ...opts, offPeakStartMin: 16 * 60 };
+      expect(chargeFloorAt(18 * 60, o).floor).toBe(0.45);
+    });
+  });
+
+  describe("guest window", () => {
+    const arrival = new Date("2026-10-09T16:00:00+02:00").getTime();
+    const departure = new Date("2026-10-12T10:00:00+02:00").getTime();
+    const stay = { occupied: false, arrival, departure };
+    const H = 3_600_000;
+
+    it("opens six hours before the arrival and closes at the departure", () => {
+      expect(guestStayActive(stay, arrival - 6 * H - 1)).toBe(false);
+      expect(guestStayActive(stay, arrival - 6 * H)).toBe(true);
+      expect(guestStayActive(stay, departure - 1)).toBe(true);
+      expect(guestStayActive(stay, departure)).toBe(false);
+    });
+    it("trusts `occupied` whatever the dates say", () => {
+      expect(guestStayActive({ occupied: true, arrival: null, departure: null }, 0)).toBe(true);
+      expect(guestStayActive({ ...stay, occupied: true }, departure + 10 * H)).toBe(true);
+    });
+    it("needs an arrival, and closes at it without a departure", () => {
+      expect(guestStayActive({ occupied: false, arrival: null, departure }, arrival)).toBe(false);
+      const open = { occupied: false, arrival, departure: null };
+      expect(guestStayActive(open, arrival - H)).toBe(true);
+      expect(guestStayActive(open, arrival + H)).toBe(false);
+      expect(guestStayActive(null, arrival)).toBe(false);
+    });
+    it("tells whether a stay touches an interval", () => {
+      expect(guestStayOverlaps(stay, arrival - 30 * H, arrival - 7 * H)).toBe(false);
+      expect(guestStayOverlaps(stay, arrival - 30 * H, arrival - 5 * H)).toBe(true);
+    });
+  });
+
+  it("raises a level by the boost, capped at 100 %, and leaves a disabled level off", () => {
+    expect(raiseLevel(0.45, 15)).toBeCloseTo(0.6);
+    expect(raiseLevel(0.95, 15)).toBe(1);
+    expect(raiseLevel(0, 15)).toBe(0);
+    expect(raiseLevel(0.45, 0)).toBe(0.45);
+  });
+
+  it("aims the night at its target only on a sunny forecast", () => {
+    const base = { forecastKwh: 11, sunnyDayKwh: 8, nightChargePct: 80, boostPts: 0 };
+    expect(nightTargetFraction(base)).toBe(0.8);
+    expect(nightTargetFraction({ ...base, boostPts: 15 })).toBe(0.95);
+    expect(nightTargetFraction({ ...base, boostPts: 30 })).toBe(1);
+    expect(nightTargetFraction({ ...base, forecastKwh: 7.9 })).toBeNull();
+    expect(nightTargetFraction({ ...base, forecastKwh: null })).toBeNull();
+    expect(nightTargetFraction({ ...base, sunnyDayKwh: null })).toBeNull();
+  });
+
+  it("sizes a solar night on the energy to its target", () => {
+    // 2791 Wh at 2200 W = 76.1 min → 77, plus the 20 min margin.
+    expect(solarNightMinutes(7443, 4652, 2200)).toBe(97);
+    expect(solarNightMinutes(4000, 4652, 2200)).toBe(0);
+  });
+});
+
+describe("v0.20 — refused start", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The 2026-10-06 shape: the floor asks, the relay closes, 0 W flows. */
+  function refusalHarness(initialState: Record<string, unknown> = {}) {
+    return buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 18 },
+        { alias: "power", category: "power", value: 0 },
+      ],
+      drawWhenOn: 0,
+      initialState: { powerProven: true, ...initialState },
+    });
+  }
+
+  it("retries an hour after a refusal instead of twelve", async () => {
+    at("2026-10-06T11:20:00");
+    const h = refusalHarness();
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    await advance(8); // grace + cut-off delay
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.logLines.some((l) => l.startsWith("Thermostat encore ouvert — nouvel essai dans 60 min"))).toBe(true);
+    const until = Date.parse(h.state.get("tankFullUntil") as string);
+    expect(until - Date.now()).toBeLessThanOrEqual(60 * 60_000);
+
+    const afterRefusal = h.orderCalls.length;
+    await advance(45);
+    expect(h.orderCalls).toHaveLength(afterRefusal); // still latched
+
+    await advance(20); // past the hour: it tries again (and is refused again)
+    expect(h.logLines).toContain("Nouvel essai : le thermostat a peut-être refermé");
+    expect(h.logLines.filter((l) => l.startsWith("Chauffe démarrée"))).toHaveLength(2);
+    expect(h.orderCalls.length).toBeGreaterThan(afterRefusal);
+    handle.stop();
+  });
+
+  it("keeps the refusal a refusal across a restart", async () => {
+    at("2026-10-06T12:30:00");
+    const h = refusalHarness({
+      tankFull: true,
+      tankFullRefused: true,
+      tankFullAt: new Date("2026-10-06T11:25:00").toISOString(), // 65 min ago
+      tankFullTemp: 18,
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("tankFull")).toBe(false);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    handle.stop();
+  });
+
+  it("keeps the long memory after a cut-off that followed a real draw", async () => {
+    at("2026-10-06T12:30:00");
+    const h = buildHarness({
+      initialState: {
+        tankFull: true,
+        tankFullRefused: false,
+        tankFullAt: new Date("2026-10-06T11:25:00").toISOString(),
+        tankFullTemp: 58,
+      },
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 57 },
+        { alias: "power", category: "power", value: 0 },
+      ],
+    });
+    const handle = createRecipe().createInstance(BASE_PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("tankFull")).toBe(true);
+    handle.stop();
+  });
+
+  it("does not count a refusal as a full cycle", async () => {
+    // 2026-10-06 10:24Z: a 0 W refusal stamped `lastFullCycleAt` and pushed
+    // the periodic full cycle five days out.
+    const before = new Date("2026-10-01T05:00:00").toISOString();
+    at("2026-10-06T11:20:00");
+    const h = refusalHarness({ lastFullCycleAt: before });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, fullCycleEveryDays: 7 },
+      h.ctx as never,
+    );
+    await advance(10);
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.state.get("lastFullCycleAt")).toBe(before);
+    handle.stop();
+  });
+
+  it("does not count a refusal seen on the household total as a full cycle", async () => {
+    const before = new Date("2026-10-01T05:00:00").toISOString();
+    at("2026-10-06T03:00:00");
+    const h = buildHarness({
+      heaterBindings: [
+        { alias: "state", category: "light_state", value: "OFF" },
+        { alias: "water_temperature", category: "temperature", value: 45 },
+      ],
+      initialState: { householdProven: true, lastFullCycleAt: before },
+      availableSurplusW: 0, // night: the grid alone is the household total
+    });
+    h.setBinding(METER, "power", 300); // the resistor never shows up
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, gridEquipment: METER, hcMode: "full", fullCycleEveryDays: 7 },
+      h.ctx as never,
+    );
+    await advance(10);
+    expect(h.state.get("tankFull")).toBe(true);
+    expect(h.state.get("lastFullCycleAt")).toBe(before);
+    handle.stop();
+  });
+
+  it("still counts a cut-off after a real draw as a full cycle", async () => {
+    const before = new Date("2026-10-01T05:00:00").toISOString();
+    at("2026-10-06T03:00:00");
+    const h = buildHarness({ initialState: { lastFullCycleAt: before } });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, hcMode: "full", fullCycleEveryDays: 7 },
+      h.ctx as never,
+    );
+    await advance(40);
+    h.setBinding(HEATER, "power", 4);
+    await advance(6);
+    expect(h.state.get("tankFull")).toBe(true);
+    const stamped = h.state.get("lastFullCycleAt") as string;
+    expect(Date.parse(stamped)).toBeGreaterThan(Date.parse(before));
+    handle.stop();
+  });
+});
+
+describe("v0.20 — night from the PV forecast", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** 200 L, 20 → 60 °C: 9304 Wh of capacity, half of it stored. */
+  const HALF_TANK = {
+    powerProven: true,
+    modelAnchored: true,
+    modelColdC: 20,
+    modelFullC: 60,
+    modelStoredWh: 4652,
+  };
+  const SOLAR = { ...BASE_PARAMS, productionEquipment: PRODUCTION, sunnyDayKwh: 8 };
+
+  function probeAt(c: number): Binding[] {
+    return [
+      { alias: "state", category: "light_state", value: "OFF" },
+      { alias: "water_temperature", category: "temperature", value: c },
+      { alias: "power", category: "power", value: 0 },
+    ];
+  }
+
+  it("places a sunny night on the energy to 80 %, late as before", async () => {
+    at("2026-10-06T22:05:00");
+    const h = buildHarness({
+      pv: { today: 11.1, tomorrow: 11.1 },
+      heaterBindings: probeAt(30),
+      initialState: HALF_TANK,
+    });
+    const handle = createRecipe().createInstance(SOLAR, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("nightPlan")).toBe("solar");
+    expect(h.state.get("nightTarget")).toBe(80);
+    // 2791 Wh / 2200 W = 77 min + 20 margin = 97 → 04:23. The probe alone
+    // (30 °C → 98 min) would have said 04:22.
+    expect(h.state.get("hcWindow")).toBe("04:23 → 06:00");
+    expect(h.state.get("summary")).toBe(
+      "Charge 50 % · sonde 30 °C · Nuit : jusqu'à 80 % (soleil 11 kWh)",
+    );
+    expect(h.orderCalls).toHaveLength(0);
+    handle.stop();
+  });
+
+  it("stops the night cycle at the target and does not restart it", async () => {
+    at("2026-10-06T22:05:00");
+    const h = buildHarness({
+      // Both days: past midnight the coming daylight is "today" — the core
+      // rolls tomorrow's figure over at its own midnight.
+      pv: { today: 11.1, tomorrow: 11.1 },
+      heaterBindings: probeAt(45),
+      initialState: HALF_TANK,
+    });
+    const handle = createRecipe().createInstance({ ...SOLAR, hcMode: "full" }, h.ctx as never);
+    await advance(1);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+
+    await advance(100); // 2791 Wh at 2200 W is ~76 min
+    expect(h.lastOrder()).toMatchObject({ value: false });
+    expect(h.logLines).toContain("Charge de nuit atteinte (80 %) — le soleil finira");
+    expect(h.state.get("tankCharge") as number).toBeGreaterThanOrEqual(79);
+    expect(h.state.get("tankCharge") as number).toBeLessThanOrEqual(82);
+
+    const stopped = h.orderCalls.length;
+    await advance(120); // standing loss pulls it under 80 — still no restart
+    expect(h.orderCalls).toHaveLength(stopped);
+    handle.stop();
+  });
+
+  it("reads tomorrow's forecast before noon's switch and today's after midnight", async () => {
+    at("2026-10-06T22:05:00");
+    const h = buildHarness({ pv: { today: 3, tomorrow: 11 }, initialState: HALF_TANK });
+    const handle = createRecipe().createInstance(SOLAR, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("pvForecastKwh")).toBe(11);
+    handle.stop();
+
+    at("2026-10-07T02:00:00");
+    const h2 = buildHarness({ pv: { today: 3, tomorrow: 11 }, initialState: HALF_TANK });
+    const handle2 = createRecipe().createInstance(SOLAR, h2.ctx as never);
+    await advance(1);
+    expect(h2.state.get("pvForecastKwh")).toBe(3);
+    expect(h2.state.get("nightPlan")).not.toBe("solar");
+    handle2.stop();
+  });
+
+  it("fills a sunless night when the tank is low, from the PV figure instead of the condition", async () => {
+    at("2026-10-06T22:05:00");
+    // The condition says sunny; the array's own model says 1.8 kWh.
+    const h = buildHarness({ pv: { tomorrow: 1.8 }, tomorrow: "sunny", initialState: HALF_TANK });
+    const handle = createRecipe().createInstance(
+      { ...SOLAR, forecastEquipment: FORECAST },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("nightPlan")).toBe("full");
+    expect(h.state.get("hcWindow")).toBe("22:00 → 06:00");
+    expect(h.state.get("summary")).toContain("Nuit : pleine (soleil 1.8 kWh)");
+    handle.stop();
+  });
+
+  it("behaves as v0.19 while the core forecast is provisional", async () => {
+    at("2026-10-06T22:05:00");
+    const h = buildHarness({ heaterBindings: probeAt(30), initialState: HALF_TANK });
+    const handle = createRecipe().createInstance(SOLAR, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("nightPlan")).toBe("thermostat");
+    expect(h.state.get("hcWindow")).toBe("04:22 → 06:00");
+    expect(h.state.get("summary")).toMatch(/^Charge 50 % · il manque 4\.\d kWh · sonde 30 °C$/);
+    handle.stop();
+  });
+
+  it("changes nothing with every new slot empty, whatever the equipment publishes", async () => {
+    at("2026-10-06T22:05:00");
+    const h = buildHarness({
+      pv: { tomorrow: 20 },
+      irradiance: irradianceSeries("2026-10-06T22:00:00", [0, 900, 900, 900, 900]),
+      guest: { occupied: true },
+      heaterBindings: probeAt(30),
+      initialState: HALF_TANK,
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, productionEquipment: PRODUCTION, forecastEquipment: FORECAST, fullCycleEveryDays: 7 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("nightPlan")).toBe("full"); // v0.19: full cycle never recorded → due
+    expect(h.state.get("hcWindow")).toBe("22:00 → 06:00");
+    expect(h.state.get("guestActive")).toBe(false);
+    expect(h.state.get("floorNow")).toBe(35);
+    expect(h.logLines.some((l) => l.startsWith("Réglages v0.20"))).toBe(false);
+    expect(h.logLines.some((l) => l.startsWith("Cycle complet"))).toBe(false);
+    expect(h.state.get("summary")).toMatch(/^Charge 50 % · il manque/);
+    handle.stop();
+  });
+});
+
+describe("v0.20 — full cycle on the sunniest day", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const PARAMS = {
+    ...BASE_PARAMS,
+    productionEquipment: PRODUCTION,
+    forecastEquipment: FORECAST,
+    sunnyDayKwh: 8,
+    fullCycleEveryDays: 7,
+  };
+
+  it("moves the cycle to the sunniest day near its due date and shows it", async () => {
+    at("2026-10-06T10:00:00"); // Tuesday
+    const h = buildHarness({
+      // Due tomorrow (6 days ago + 7). Today 3 kWh, tomorrow 12, Thursday
+      // 900 W/m² → 18 kWh, Friday 300 → 6 kWh.
+      pv: { today: 3, tomorrow: 12 },
+      irradiance: irradianceSeries("2026-10-06T10:00:00", [200, 600, 900, 300, 100]),
+      initialState: { lastFullCycleAt: new Date("2026-09-30T05:00:00").toISOString() },
+    });
+    const handle = createRecipe().createInstance(PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("fullCyclePlan")).toBe("2026-10-08");
+    expect(h.state.get("fullCycleKwh")).toBe(18);
+    expect(h.logLines).toContain("Cycle complet placé jeudi — 18 kWh de solaire prévus");
+    handle.stop();
+  });
+
+  it("leaves the nights before the chosen day alone, even overdue", async () => {
+    at("2026-10-06T22:05:00");
+    const h = buildHarness({
+      pv: { today: 3, tomorrow: 12 },
+      initialState: { lastFullCycleAt: new Date("2026-09-28T05:00:00").toISOString() },
+    });
+    const handle = createRecipe().createInstance(PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("fullCyclePlan")).toBe("2026-10-07");
+    expect(h.state.get("nightPlan")).toBe("thermostat"); // unanchored: no 80 % stop
+    expect(h.state.get("hcWindow")).not.toBe("22:00 → 06:00");
+    handle.stop();
+  });
+
+  it("falls back to the full night with no sunny candidate", async () => {
+    at("2026-10-06T22:05:00");
+    const h = buildHarness({
+      pv: { today: 3, tomorrow: 2 },
+      irradiance: irradianceSeries("2026-10-06T22:00:00", [0, 200, 200, 200, 200]),
+      initialState: { lastFullCycleAt: new Date("2026-09-28T05:00:00").toISOString() },
+    });
+    const handle = createRecipe().createInstance(PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("fullCyclePlan")).toBe("night");
+    expect(h.state.get("hcWindow")).toBe("22:00 → 06:00");
+    handle.stop();
+  });
+
+  it("forces the night once due + 2 has passed, sun or not", async () => {
+    at("2026-10-06T22:05:00");
+    const h = buildHarness({
+      pv: { today: 15, tomorrow: 15 },
+      // Due 2026-10-04: today is due + 2, and its sun is spent at 22:05.
+      initialState: { lastFullCycleAt: new Date("2026-09-27T05:00:00").toISOString() },
+    });
+    const handle = createRecipe().createInstance(PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("fullCyclePlan")).toBe("night");
+    expect(h.state.get("hcWindow")).toBe("22:00 → 06:00");
+    handle.stop();
+  });
+
+  it("keeps asking for surplus to the thermostat on the chosen day", async () => {
+    // Nearly full tank: v0.19 holds the claim back (less than one shower
+    // missing). On the full-cycle day the thermostat is the goal.
+    const nearlyFull = {
+      powerProven: true,
+      modelAnchored: true,
+      modelColdC: 20,
+      modelFullC: 60,
+      modelStoredWh: 9000,
+      lastFullCycleAt: new Date("2026-09-29T05:00:00").toISOString(),
+    };
+    at("2026-10-06T11:00:00");
+    const h = buildHarness({ pv: { today: 14, tomorrow: 3 }, heaterBindings: undefined, initialState: nearlyFull });
+    h.setBinding(HEATER, "water_temperature", 58);
+    const handle = createRecipe().createInstance(PARAMS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("fullCyclePlan")).toBe("2026-10-06");
+    expect(h.liveClaim()).toBeDefined();
+    expect(h.state.get("summary")).toContain("Cycle complet : aujourd'hui");
+    handle.stop();
+
+    const h2 = buildHarness({ initialState: nearlyFull });
+    h2.setBinding(HEATER, "water_temperature", 58);
+    const handle2 = createRecipe().createInstance(
+      { ...PARAMS, sunnyDayKwh: undefined },
+      h2.ctx as never,
+    );
+    await advance(1);
+    expect(h2.liveClaim()).toBeUndefined();
+    handle2.stop();
+  });
+});
+
+describe("v0.20 — evening floor and guests", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** 55 % of a 200 L tank, probe high enough not to trip the °C floor. */
+  const AT_55 = {
+    powerProven: true,
+    modelAnchored: true,
+    modelColdC: 20,
+    modelFullC: 60,
+    modelStoredWh: 5117,
+  };
+  const FLOORS = { ...BASE_PARAMS, rescueCharge: 45, rescueChargeEvening: 60 };
+
+  it("raises the floor at eveningFrom and lowers it at the off-peak start", async () => {
+    at("2026-10-06T16:55:00");
+    const h = buildHarness({ initialState: AT_55 });
+    const handle = createRecipe().createInstance(FLOORS, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("floorNow")).toBe(45);
+    expect(h.orderCalls).toHaveLength(0);
+
+    await advance(5); // 17:01
+    expect(h.state.get("floorNow")).toBe(60);
+    expect(h.state.get("eveningFloor")).toBe(true);
+    expect(h.lastOrder()).toMatchObject({ value: true });
+    expect(h.state.get("reason")).toBe("floor");
+    handle.stop();
+
+    at("2026-10-06T21:58:00");
+    const h2 = buildHarness({ initialState: { ...AT_55, modelStoredWh: 9000 } });
+    const handle2 = createRecipe().createInstance(FLOORS, h2.ctx as never);
+    await advance(1);
+    expect(h2.state.get("floorNow")).toBe(60);
+    await advance(2); // 22:01
+    expect(h2.state.get("floorNow")).toBe(45);
+    expect(h2.state.get("eveningFloor")).toBe(false);
+    handle2.stop();
+  });
+
+  it("keeps one floor all day with the evening slot empty", async () => {
+    at("2026-10-06T18:00:00");
+    const h = buildHarness({ initialState: AT_55 });
+    const handle = createRecipe().createInstance({ ...BASE_PARAMS, rescueCharge: 45 }, h.ctx as never);
+    await advance(1);
+    expect(h.state.get("floorNow")).toBe(45);
+    expect(h.orderCalls).toHaveLength(0);
+    handle.stop();
+  });
+
+  it("raises every level while guests are due or in, and says so on the card", async () => {
+    at("2026-10-09T11:00:00");
+    const h = buildHarness({
+      initialState: AT_55,
+      guest: {
+        occupied: false,
+        arrival: new Date("2026-10-09T16:00:00").toISOString(),
+        departure: new Date("2026-10-12T10:00:00").toISOString(),
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...FLOORS, guestStays: GUESTS, guestBoost: 15 },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("guestActive")).toBe(true);
+    expect(h.state.get("floorNow")).toBe(60); // 45 + 15
+    expect(h.state.get("chargeUpTo")).toBe(80); // 65 + 15
+    expect(h.lastOrder()).toMatchObject({ value: true }); // 55 % < 60 %
+    expect(h.state.get("summary")).toContain("Séjour : +15 pts");
+    expect(h.logLines).toContain("Séjour en cours — niveaux de charge relevés de 15 pts");
+    handle.stop();
+  });
+
+  it("is idle outside the stay", async () => {
+    at("2026-10-09T09:00:00"); // 7 h before the arrival
+    const h = buildHarness({
+      initialState: AT_55,
+      guest: {
+        arrival: new Date("2026-10-09T16:00:00").toISOString(),
+        departure: new Date("2026-10-12T10:00:00").toISOString(),
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...FLOORS, guestStays: GUESTS },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("guestActive")).toBe(false);
+    expect(h.state.get("floorNow")).toBe(45);
+    expect(h.orderCalls).toHaveLength(0);
+    handle.stop();
+  });
+
+  it("fills a sunless night before an arrival, whatever the charge", async () => {
+    at("2026-10-08T22:05:00");
+    const h = buildHarness({
+      pv: { tomorrow: 1.8 },
+      initialState: { ...AT_55, modelStoredWh: 8500 }, // 91 %: v0.19 would not fill
+      guest: {
+        arrival: new Date("2026-10-09T16:00:00").toISOString(),
+        departure: new Date("2026-10-12T10:00:00").toISOString(),
+      },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, productionEquipment: PRODUCTION, sunnyDayKwh: 8, guestStays: GUESTS },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("nightPlan")).toBe("full");
+    expect(h.state.get("hcWindow")).toBe("22:00 → 06:00");
+    expect(h.logLines).toContain("Nuit pleine en heures creuses (arrivée de clients sans soleil)");
+    handle.stop();
+  });
+
+  it("raises the solar-night target during a stay", async () => {
+    at("2026-10-10T22:05:00");
+    const h = buildHarness({
+      pv: { tomorrow: 11 },
+      initialState: AT_55,
+      guest: { occupied: true },
+    });
+    const handle = createRecipe().createInstance(
+      { ...BASE_PARAMS, productionEquipment: PRODUCTION, sunnyDayKwh: 8, guestStays: GUESTS },
+      h.ctx as never,
+    );
+    await advance(1);
+    expect(h.state.get("nightTarget")).toBe(95);
+    handle.stop();
+  });
+});
+
+describe("v0.20 — validation", () => {
+  const { ctx } = buildHarness();
+  const v = (p: Record<string, unknown>) => () =>
+    createRecipe().validate({ ...BASE_PARAMS, ...p }, ctx as never);
+
+  it("accepts Adrien's settings", () => {
+    expect(
+      v({
+        rescueCharge: 45,
+        rescueChargeEvening: 60,
+        rescueChargeUpTo: 65,
+        eveningFrom: "17:00",
+        sunnyDayKwh: 8,
+        nightChargeSunny: 80,
+        guestStays: GUESTS,
+        guestBoost: 15,
+        productionEquipment: PRODUCTION,
+      }),
+    ).not.toThrow();
+  });
+  it("wants the evening floor at least the day floor, and the target above both", () => {
+    expect(v({ rescueCharge: 45, rescueChargeEvening: 40 })).toThrow(/at least the charge floor/);
+    expect(v({ rescueCharge: 45, rescueChargeEvening: 65, rescueChargeUpTo: 65 })).toThrow(
+      /above the evening charge floor/,
+    );
+  });
+  it("checks the sunny-night target only when the threshold is set", () => {
+    expect(v({ rescueCharge: 85, rescueChargeUpTo: 95 })).not.toThrow();
+    expect(v({ sunnyDayKwh: 8, rescueCharge: 85, rescueChargeUpTo: 95 })).toThrow(
+      /above the charge floor/,
+    );
+    expect(v({ sunnyDayKwh: 8, nightChargeSunny: 101 })).toThrow(/cannot exceed 100/);
+    expect(v({ sunnyDayKwh: 0 })).toThrow(/above 0 kWh/);
+  });
+  it("bounds the guest boost and checks the time and the equipment", () => {
+    expect(v({ guestBoost: 51 })).toThrow(/between 0 and 50/);
+    expect(v({ guestBoost: -1 })).toThrow(/between 0 and 50/);
+    expect(v({ eveningFrom: "5pm" })).toThrow(/like 17:00/);
+    expect(v({ guestStays: "gone" })).toThrow(/no longer exists/);
   });
 });
